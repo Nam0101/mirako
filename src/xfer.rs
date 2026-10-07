@@ -10,14 +10,62 @@ use anyhow::{bail, Context, Result};
 use filetime::FileTime;
 use std::collections::HashMap;
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
+use std::io;
 use std::path::{Path, PathBuf};
 
 pub fn safe_join(root: &Path, rel: &str) -> Result<PathBuf> {
-    if rel.is_empty() || rel.starts_with('/') || rel.split('/').any(|c| c == "..") {
+    // on Windows `\` separates as well and `C:` starts the path over; no file name there holds either
+    let foreign = cfg!(windows) && rel.contains(['\\', ':']);
+    if rel.is_empty() || rel.starts_with('/') || rel.split('/').any(|c| c == "..") || foreign {
         bail!("refusing path `{rel}`");
     }
     Ok(root.join(rel))
+}
+
+/// `canonicalize` without the `\\?\` prefix Windows puts on the result: under that prefix `/` is
+/// no separator, and the paths of the wire are joined to a root as they come. Every root (and
+/// the binary named in the Gradle init script) goes through this.
+pub fn canonical(p: &Path) -> io::Result<PathBuf> {
+    let c = p.canonicalize()?;
+    #[cfg(windows)]
+    if let Some(plain) = c.to_str().and_then(|s| s.strip_prefix(r"\\?\")) {
+        return Ok(match plain.strip_prefix(r"UNC\") {
+            Some(share) => PathBuf::from(format!(r"\\{share}")),
+            None => PathBuf::from(plain),
+        });
+    }
+    Ok(c)
+}
+
+#[cfg(unix)]
+fn set_mode(path: &Path, mode: u32) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, fs::Permissions::from_mode(mode))
+}
+
+/// Windows has no permission bits to set.
+#[cfg(not(unix))]
+fn set_mode(_: &Path, _: u32) -> io::Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn make_symlink(target: &str, link: &Path) -> Result<()> {
+    if let Some(parent) = link.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let _ = fs::remove_file(link);
+    Ok(std::os::unix::fs::symlink(target, link)?)
+}
+
+/// Windows gets no links, and what is at `link` stays: making one takes Developer Mode there,
+/// and its kind (file or directory) would depend on files that are still on their way.
+#[cfg(not(unix))]
+fn make_symlink(target: &str, link: &Path) -> Result<()> {
+    bail!(
+        "{} is a symlink to `{target}` on the other side: not made on Windows",
+        link.display()
+    )
 }
 
 struct Inbound {
@@ -90,9 +138,15 @@ impl Inbox {
                 });
             }
         }
-        fs::set_permissions(&tmp, fs::Permissions::from_mode(mode))?;
+        set_mode(&tmp, mode)?;
         let _ = fs::remove_file(&dest);
         fs::rename(&tmp, &dest)?;
+        // NTFS keeps 100 ns: report the mtime a later scan reads back, or its cache entry never hits
+        let mtime_ns = if cfg!(windows) {
+            mtime_ns - mtime_ns.rem_euclid(100)
+        } else {
+            mtime_ns
+        };
         let ft = FileTime::from_unix_time(mtime_ns.div_euclid(1_000_000_000), mtime_ns.rem_euclid(1_000_000_000) as u32);
         filetime::set_file_mtime(&dest, ft)?;
         Ok(Finished {
@@ -135,13 +189,7 @@ impl Inbox {
     }
 
     pub fn symlink(&mut self, root: &Path, rel: &str, target: &str) -> Result<()> {
-        let p = safe_join(root, rel)?;
-        if let Some(parent) = p.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        let _ = fs::remove_file(&p);
-        std::os::unix::fs::symlink(target, &p)?;
-        Ok(())
+        make_symlink(target, &safe_join(root, rel)?)
     }
 }
 
@@ -151,7 +199,8 @@ mod tests {
     use crate::index;
     use crate::proto::Signature;
 
-    const MTIME: i64 = 1_700_000_000_123_456_789;
+    /// A multiple of 100 ns, which is all NTFS keeps.
+    const MTIME: i64 = 1_700_000_000_123_456_700;
 
     fn chunk(path: &str, offset: u64, last: bool, bytes: &[u8], size: u64) -> Chunk {
         Chunk {
@@ -213,9 +262,23 @@ mod tests {
         for bad in ["", "/abs", "..", "a/../b", "../x", "a/.."] {
             assert!(safe_join(root, bad).is_err(), "{bad:?} accepted");
         }
+        // `\` and `C:` are ordinary characters of a file name, except on Windows
+        for windows_escape in ["a\\..\\..\\b", "\\abs", "C:\\abs", "C:rel", "a/b:stream"] {
+            assert_eq!(safe_join(root, windows_escape).is_err(), cfg!(windows), "{windows_escape:?}");
+        }
         // current behaviour: `.` and empty components are harmless and accepted as is
         assert_eq!(safe_join(root, "a/./b").unwrap(), root.join("a/./b"));
         assert_eq!(safe_join(root, "a//b").unwrap(), root.join("a//b"));
+    }
+
+    #[test]
+    fn a_canonical_root_takes_the_slash_paths_of_the_wire() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = canonical(dir.path()).unwrap();
+        assert!(!root.to_string_lossy().starts_with(r"\\?\"), "{}", root.display());
+        Inbox::default().put(&root, &chunk("a/b/f", 0, true, b"x", 1)).unwrap();
+        assert_eq!(fs::read(dir.path().join("a").join("b").join("f")).unwrap(), b"x");
+        assert!(canonical(&root.join("missing")).is_err());
     }
 
     #[test]
@@ -241,7 +304,7 @@ mod tests {
         let dest = root.join("x/y/f.bin");
         assert_eq!(fs::read(&dest).unwrap(), data);
         let md = fs::metadata(&dest).unwrap();
-        assert_eq!(md.permissions().mode() & 0o7777, 0o640);
+        assert_eq!(index::mode(&md), if cfg!(unix) { 0o640 } else { 0o755 });
         assert_eq!(index::mtime_ns(&md), MTIME);
         assert!(tmp_files(&root.join("x/y")).is_empty());
     }
@@ -306,7 +369,7 @@ mod tests {
         assert_eq!(done.hash, *blake3::hash(&new).as_bytes());
         assert_eq!(fs::read(root.join("f.bin")).unwrap(), new);
         let md = fs::metadata(root.join("f.bin")).unwrap();
-        assert_eq!(md.permissions().mode() & 0o7777, 0o640);
+        assert_eq!(index::mode(&md), if cfg!(unix) { 0o640 } else { 0o755 });
         assert_eq!(index::mtime_ns(&md), MTIME);
         assert!(tmp_files(root).is_empty());
     }
@@ -352,6 +415,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)] // creating a link on Windows takes Developer Mode
     fn symlink_creates_parents_and_replaces_files_and_links() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();

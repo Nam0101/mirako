@@ -1,6 +1,8 @@
-# Runs on the self-hosted runner on the m4 (labels: self-hosted, macOS, ARM64, m4).
+# macOS runs on the self-hosted runner on the m4 (labels: self-hosted, macOS, ARM64, m4).
 # The runner's user has rustup in ~/.cargo; the service does not source a shell profile,
-# so every job puts ~/.cargo/bin on PATH first. One runner, so stale PR runs are cancelled.
+# so every job there puts ~/.cargo/bin on PATH first. One runner, so stale PR runs are cancelled.
+# Linux and Windows run on GitHub-hosted runners (free for a public repository), on the
+# targets the release ships: static musl binaries for Linux, MSVC for Windows.
 name: ci
 
 on:
@@ -16,10 +18,14 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: "0"
+  # the C in zstd and blake3 on the Linux targets: Ubuntu's musl-tools has `musl-gcc` only,
+  # and for arm64 the cc crate would look for `aarch64-linux-musl-gcc`
+  CC_x86_64_unknown_linux_musl: musl-gcc
+  CC_aarch64_unknown_linux_musl: musl-gcc
 
 jobs:
   check:
-    name: fmt, clippy, test
+    name: fmt, clippy, test (macos-arm64)
     runs-on: [self-hosted, macOS, ARM64, m4]
     steps:
       - uses: actions/checkout@v4
@@ -28,6 +34,26 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test
+
+  portable:
+    name: clippy, test (${{ matrix.name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: linux-x86_64, os: ubuntu-latest, target: x86_64-unknown-linux-musl }
+          - { name: linux-arm64, os: ubuntu-24.04-arm, target: aarch64-unknown-linux-musl }
+          - { name: windows-x86_64, os: windows-latest, target: x86_64-pc-windows-msvc }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup update stable --no-self-update && rustup default stable && rustup target add ${{ matrix.target }} && rustup component add clippy
+      - if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - run: rustc --version && cargo --version
+      - run: cargo clippy --all-targets --target ${{ matrix.target }} -- -D warnings
+      # on Windows the unit tests only: tests/e2e.rs needs `sh` and a `HOME` sandbox
+      - run: cargo test --target ${{ matrix.target }}
 
   bench:
     name: criterion
@@ -48,29 +74,60 @@ jobs:
             target/criterion
           retention-days: 30
 
-  release:
-    name: release binary
-    needs: check
+  build:
+    name: release binary (${{ matrix.name }})
+    needs: [check, portable]
     if: startsWith(github.ref, 'refs/tags/v')
-    runs-on: [self-hosted, macOS, ARM64, m4]
-    permissions:
-      contents: write
+    strategy:
+      matrix:
+        include:
+          - { name: macos-arm64, os: [self-hosted, macOS, ARM64, m4], target: aarch64-apple-darwin }
+          - { name: linux-x86_64, os: ubuntu-latest, target: x86_64-unknown-linux-musl }
+          - { name: linux-arm64, os: ubuntu-24.04-arm, target: aarch64-unknown-linux-musl }
+          - { name: windows-x86_64, os: windows-latest, target: x86_64-pc-windows-msvc, exe: .exe }
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@v4
-      - run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
       - name: the tag must match Cargo.toml (the protocol version)
         run: |
           v=$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
           [ "v$v" = "${GITHUB_REF_NAME}" ] || { echo "tag ${GITHUB_REF_NAME} but Cargo.toml says $v"; exit 1; }
-      - run: cargo build --release
+      - if: runner.environment == 'self-hosted'
+        run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - if: runner.environment == 'github-hosted'
+        run: rustup update stable --no-self-update && rustup default stable && rustup target add ${{ matrix.target }}
+      - if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - run: cargo build --release --target ${{ matrix.target }}
+        env:
+          # read for that target only: the .exe runs without the Visual C++ runtime installed
+          CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS: -C target-feature=+crt-static
       - run: |
           mkdir -p dist
-          cp target/release/mirako "dist/mirako-${GITHUB_REF_NAME}-macos-arm64"
-          (cd dist && shasum -a 256 * > SHA256SUMS)
+          cp "target/${{ matrix.target }}/release/mirako${{ matrix.exe }}" "dist/mirako-${GITHUB_REF_NAME}-${{ matrix.name }}${{ matrix.exe }}"
       - uses: actions/upload-artifact@v4
         with:
-          name: mirako-${{ github.ref_name }}-macos-arm64
+          name: mirako-${{ github.ref_name }}-${{ matrix.name }}
           path: dist
+
+  release:
+    name: github release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: mirako-*
+          path: dist
+          merge-multiple: true
+      - run: cd dist && shasum -a 256 * > SHA256SUMS
       - run: gh release create "${GITHUB_REF_NAME}" dist/* --title "${GITHUB_REF_NAME}" --generate-notes
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}

@@ -31,8 +31,17 @@ build outputs back. It is a single Rust binary, installed on both ends, in the s
 
 ## Install
 
+Every [release](https://github.com/Nam0101/mirako/releases) has binaries for macOS (arm64),
+Linux (x86_64 and arm64, static) and Windows (x86_64): put the one for your machine on `PATH`
+as `mirako`. Or build it:
+
 ```
 cargo install --git https://github.com/Nam0101/mirako
+```
+
+Then, once:
+
+```
 mirako setup --host m4                   # global config, Gradle init script, agent on the host, handshake
 ```
 
@@ -50,6 +59,22 @@ own: `mirako init --global`, `mirako gradle-shim install`, `mirako remote-instal
 
 The remote needs whatever the command needs (JDK, Android SDK, …) reachable from a
 non-interactive ssh shell. On macOS put `JAVA_HOME`/`ANDROID_HOME`/`PATH` in `~/.zshenv`.
+
+### Windows
+
+Windows is a client only: the builds run on a macOS or Linux host, reached with the `ssh` that
+ships with Windows. What differs from a Unix client:
+
+- `mirako setup` cannot set up key authentication there (no `ssh-copy-id`): make `ssh <host>`
+  work without a password first.
+- The agent is always built on the host by its cargo, as for any host of another OS, so Rust
+  must be installed on the host.
+- Windows has no permission bits: every file is uploaded as 0755, which lets `./gradlew` run on
+  the host. It also needs LF line endings there (`gradlew text eol=lf` in `.gitattributes`).
+- Symlinks among the downloaded files are not created; one line on stderr counts them
+  (`exclude_remote_extra` leaves them out).
+- With `fallback = true`, a `./gradlew …` that cannot reach the host runs the `gradlew.bat`
+  next to it.
 
 ## Configure
 
@@ -155,7 +180,7 @@ scans its copy of the download scope, computes block signatures of its big files
 both up, so the moment the command exits the agent streams exactly what differs, deltas
 included, without another exchange.
 
-The protocol is length-prefixed bincode frames on the agent's stdin/stdout (`mirako serve`),
+The protocol is length-prefixed postcard frames on the agent's stdin/stdout (`mirako serve`),
 so nothing listens on a port and ssh handles auth and encryption.
 
 ## License

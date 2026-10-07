@@ -12,6 +12,7 @@ use crate::xfer::Inbox;
 use anyhow::{bail, Context, Result};
 use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
+use std::ffi::OsString;
 use std::fs;
 use std::io::{self, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -45,6 +46,8 @@ enum Attempt {
     Up(Session),
     /// the remote shell exited 127: no `remote_bin` there
     Missing,
+    /// the agent left without a word: it could not decode the `Hello` (0.4 or older, bincode frames)
+    Mute,
     /// the agent answered with this other version
     Version(String),
 }
@@ -61,12 +64,14 @@ pub struct Stats {
 impl Session {
     /// Starts `mirako serve` over ssh and shakes hands. `first` goes out in the same write as
     /// the `Hello`, so the agent is already working on it while the reply crosses the link.
-    /// `ssh host 'mirako serve'` plus the handshake. When the agent is missing there or runs
-    /// another version, this binary is installed as `remote_bin` and the connection retried once.
+    /// `ssh host 'mirako serve'` plus the handshake. When the agent is missing there, runs
+    /// another version or does not answer, this binary is installed as `remote_bin` and the
+    /// connection retried once.
     pub fn connect(cfg: &Config, first: Option<&Req>) -> Result<Self> {
         let why = match Self::attempt(cfg, first)? {
             Attempt::Up(s) => return Ok(s),
             Attempt::Missing => format!("no `{}` on {}", cfg.remote_bin, cfg.host),
+            Attempt::Mute => format!("`{}` on {} does not answer the handshake (0.4 or older)", cfg.remote_bin, cfg.host),
             Attempt::Version(v) => format!("remote mirako is {v}, local is {}", proto::VERSION),
         };
         eprintln!("mirako: {why}: installing mirako {} there", proto::VERSION);
@@ -74,6 +79,11 @@ impl Session {
         match Self::attempt(cfg, first)? {
             Attempt::Up(s) => Ok(s),
             Attempt::Missing => bail!("still no `{}` on {} right after installing it", cfg.remote_bin, cfg.host),
+            Attempt::Mute => bail!(
+                "`{}` on {} still does not answer right after installing it",
+                cfg.remote_bin,
+                cfg.host
+            ),
             Attempt::Version(v) => bail!("remote mirako is still {v} right after installing {}", proto::VERSION),
         }
     }
@@ -104,9 +114,12 @@ impl Session {
         let hello = match handshake {
             Ok(hello) => hello,
             Err(e) => {
-                // the remote shell could not run `remote_bin`: 127 not found, 126 not executable
-                if matches!(child.wait().ok().and_then(|s| s.code()), Some(126 | 127)) {
-                    return Ok(Attempt::Missing);
+                match child.wait().ok().and_then(|s| s.code()) {
+                    // the remote shell could not run `remote_bin`: 127 not found, 126 not executable
+                    Some(126 | 127) => return Ok(Attempt::Missing),
+                    // `serve` ends cleanly on a frame it cannot decode
+                    Some(0) => return Ok(Attempt::Mute),
+                    _ => {}
                 }
                 bail!(
                     "no answer from `{} serve` on {} ({e}). Is the host reachable and mirako installed there? Try `mirako remote-install`.",
@@ -340,6 +353,8 @@ impl Session {
     fn receive(&mut self, root: &Path, index: &mut Index, stats: &mut Stats) -> Result<Vec<String>> {
         let mut inbox = Inbox::default();
         let mut failed = Vec::new();
+        // Windows: the links of the host, which this side does not make (see `xfer::make_symlink`)
+        let mut no_link = Vec::new();
         loop {
             match self.recv()? {
                 Resp::Put(chunk) => {
@@ -367,6 +382,7 @@ impl Session {
                         }
                     }
                 }
+                Resp::Symlink { path, .. } if cfg!(windows) => no_link.push(path),
                 Resp::Symlink { path, target } => {
                     inbox.symlink(root, &path, &target)?;
                     stats.files += 1;
@@ -374,6 +390,12 @@ impl Session {
                 Resp::End => break,
                 other => bail!("unexpected reply {other:?}"),
             }
+        }
+        if let Some(first) = no_link.first() {
+            eprintln!(
+                "mirako: {} symlink(s) of the host not made here, Windows gets none (the first: {first}); `exclude_remote_extra` leaves them out",
+                no_link.len()
+            );
         }
         Ok(failed)
     }
@@ -691,9 +713,20 @@ pub fn gc(cfg: &Config, days: Option<u32>, dry_run: bool) -> Result<()> {
     Ok(())
 }
 
+/// The program of a command as this machine runs it. The command is spelled for the host, so on
+/// Windows a `./gradlew` is the `gradlew.bat` beside it.
+fn local_program(root: &Path, program: &str) -> OsString {
+    let bat: PathBuf = root.join(program).with_extension("bat").components().collect();
+    if cfg!(windows) && bat.is_file() {
+        bat.into()
+    } else {
+        program.into()
+    }
+}
+
 pub fn run_local(root: &Path, cmd: &[String]) -> Result<i32> {
     // tell the Gradle shim not to try the remote again
-    let status = Command::new(&cmd[0])
+    let status = Command::new(local_program(root, &cmd[0]))
         .args(&cmd[1..])
         .env("MIRAKO_LOCAL", "1")
         .current_dir(root)
@@ -732,7 +765,8 @@ pub fn remote_install(cfg: &Config) -> Result<()> {
         };
         Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
     };
-    let local = uname(false)?;
+    // Windows has no `uname`, and no host answers like it would: the agent is built there
+    let local = if cfg!(windows) { String::new() } else { uname(false)? };
     let remote = uname(true)?;
     if remote.is_empty() {
         bail!("cannot ssh to {}", cfg.host);
@@ -812,6 +846,20 @@ mod tests {
             s.ends_with("mv \"$HOME/.mirako-build/bin/mirako\" ~/.local/bin/mirako && ~/.local/bin/mirako --version"),
             "{s}"
         );
+    }
+
+    #[test]
+    fn the_local_fallback_runs_the_bat_beside_the_command_on_windows_only() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("gradlew"), "").unwrap();
+        fs::write(dir.path().join("gradlew.bat"), "").unwrap();
+        let wrapper = PathBuf::from(local_program(dir.path(), "./gradlew"));
+        if cfg!(windows) {
+            assert_eq!(wrapper, dir.path().join("gradlew.bat"));
+        } else {
+            assert_eq!(wrapper, Path::new("./gradlew"));
+        }
+        assert_eq!(local_program(dir.path(), "echo"), OsString::from("echo"));
     }
 
     #[test]

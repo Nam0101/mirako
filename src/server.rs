@@ -6,12 +6,11 @@ use crate::gc;
 use crate::index::{self, Index};
 use crate::patterns::Matcher;
 use crate::proto::{self, read_frame, write_frame, Chunk, DeltaChunk, Entry, Kind, Req, Resp, Signature, CHUNK};
-use crate::xfer::{safe_join, Inbox};
+use crate::xfer::{canonical, safe_join, Inbox};
 use anyhow::{bail, Context, Result};
 use std::collections::HashMap;
 use std::fs;
 use std::io::{self, BufReader, BufWriter, Read, Write};
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
@@ -121,7 +120,7 @@ pub fn serve() -> Result<()> {
                 Ok(())
             }
             Req::Sigs { dir, paths } => {
-                let root = expand_home(&dir).canonicalize()?;
+                let root = canonical(&expand_home(&dir))?;
                 let mut sigs = Vec::new();
                 for p in paths {
                     let full = safe_join(&root, &p)?;
@@ -165,7 +164,7 @@ pub fn serve() -> Result<()> {
                 send(&out, &Resp::End)
             }
             Req::Fetch { dir, paths } => {
-                let root = expand_home(&dir).canonicalize()?;
+                let root = canonical(&expand_home(&dir))?;
                 for p in paths {
                     let full = safe_join(&root, &p)?;
                     let md = fs::symlink_metadata(&full)?;
@@ -192,7 +191,7 @@ pub fn serve() -> Result<()> {
 fn open_root<'a>(index: &'a mut Option<(PathBuf, Index)>, dir: &str) -> Result<(&'a Path, &'a mut Index)> {
     let root = expand_home(dir);
     fs::create_dir_all(&root)?;
-    let root = root.canonicalize()?;
+    let root = canonical(&root)?;
     if index.as_ref().map(|(r, _)| r != &root).unwrap_or(true) {
         *index = Some((root.clone(), Index::open(&root)));
     }
@@ -226,7 +225,7 @@ fn send_entry(out: &Out, root: &Path, e: &Entry, sig: Option<&Signature>) -> Res
 fn send_file(out: &Out, full: &Path, rel: &str, md: &fs::Metadata) -> Result<()> {
     let mut f = fs::File::open(full)?;
     let size = md.len();
-    let mode = md.permissions().mode() & 0o7777;
+    let mode = index::mode(md);
     let mtime_ns = index::mtime_ns(md);
     let mut offset = 0u64;
     let mut buf = vec![0u8; CHUNK];
@@ -260,7 +259,7 @@ fn send_delta(out: &Out, full: &Path, rel: &str, md: &fs::Metadata, hash: [u8; 3
     let data = fs::read(full)?;
     let head = DeltaChunk {
         path: rel.into(),
-        mode: md.permissions().mode() & 0o7777,
+        mode: index::mode(md),
         mtime_ns: index::mtime_ns(md),
         size: data.len() as u64,
         hash,

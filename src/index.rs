@@ -9,7 +9,6 @@ use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 use walkdir::WalkDir;
@@ -43,7 +42,7 @@ impl Index {
         let _ = fs::create_dir_all(cache_file.parent().unwrap());
         let cache = fs::read(&cache_file)
             .ok()
-            .and_then(|b| bincode::deserialize(&b).ok())
+            .and_then(|b| postcard::from_bytes(&b).ok())
             .unwrap_or_default();
         Self {
             cache_file,
@@ -88,13 +87,16 @@ impl Index {
             }
             if ft.is_symlink() {
                 let target = fs::read_link(e.path())?.to_string_lossy().into_owned();
+                // the wire is `/`-separated, the target of a link made on Windows is not
+                #[cfg(windows)]
+                let target = target.replace('\\', "/");
                 let md = e.path().symlink_metadata()?;
                 links.push(Entry {
                     path: rel,
                     kind: Kind::Symlink { target: target.clone() },
                     size: 0,
                     mtime_ns: mtime_ns(&md),
-                    mode: md.permissions().mode() & 0o7777,
+                    mode: mode(&md),
                     hash: *blake3::hash(target.as_bytes()).as_bytes(),
                 });
             } else if ft.is_file() {
@@ -108,7 +110,7 @@ impl Index {
         for (rel, md) in files {
             let size = md.len();
             let mt = mtime_ns(&md);
-            let mode = md.permissions().mode() & 0o7777;
+            let mode = mode(&md);
             match self.cache.files.get(&rel) {
                 Some(&(csize, cmt, hash)) if csize == size && cmt == mt => {
                     entries.push(Entry {
@@ -161,7 +163,7 @@ impl Index {
         if !self.dirty && filetime::set_file_mtime(&self.cache_file, FileTime::now()).is_ok() {
             return;
         }
-        if let Ok(bytes) = bincode::serialize(&self.cache) {
+        if let Ok(bytes) = postcard::to_stdvec(&self.cache) {
             let tmp = self.cache_file.with_extension("tmp");
             if fs::write(&tmp, bytes).is_ok() {
                 let _ = fs::rename(&tmp, &self.cache_file);
@@ -190,7 +192,7 @@ pub struct Sigs {
 impl Sigs {
     pub fn open(root: &Path) -> Self {
         let file = Index::cache_path(root).with_extension("sig");
-        let cache = fs::read(&file).ok().and_then(|b| bincode::deserialize(&b).ok()).unwrap_or_default();
+        let cache = fs::read(&file).ok().and_then(|b| postcard::from_bytes(&b).ok()).unwrap_or_default();
         Self { file, cache, dirty: false }
     }
 
@@ -219,7 +221,7 @@ impl Sigs {
         if !self.dirty {
             return;
         }
-        if let Ok(bytes) = bincode::serialize(&self.cache) {
+        if let Ok(bytes) = postcard::to_stdvec(&self.cache) {
             let tmp = self.file.with_extension("sig.tmp");
             if fs::write(&tmp, bytes).is_ok() {
                 let _ = fs::rename(&tmp, &self.file);
@@ -244,11 +246,25 @@ pub fn rel_path(root: &Path, p: &Path) -> String {
 }
 
 pub fn mtime_ns(md: &fs::Metadata) -> i64 {
-    md.modified()
-        .ok()
-        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-        .map(|d| d.as_nanos() as i64)
-        .unwrap_or_else(|| md.mtime() * 1_000_000_000)
+    let Ok(t) = md.modified() else { return 0 };
+    match t.duration_since(UNIX_EPOCH) {
+        Ok(d) => d.as_nanos() as i64,
+        Err(before) => -(before.duration().as_nanos() as i64),
+    }
+}
+
+/// The permission bits of the wire.
+#[cfg(unix)]
+pub fn mode(md: &fs::Metadata) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    md.permissions().mode() & 0o7777
+}
+
+/// Windows has no permission bits: every file counts as 0755, so that the `gradlew` it pushes
+/// can run on the host.
+#[cfg(not(unix))]
+pub fn mode(_: &fs::Metadata) -> u32 {
+    0o755
 }
 
 /// From this size up blake3 maps the file and hashes it on all cores: an 84 MB APK takes ~10 ms
@@ -269,7 +285,8 @@ pub fn hash_file(path: &Path) -> Result<[u8; 32]> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::fs::symlink;
+    #[cfg(unix)]
+    use std::os::unix::fs::{symlink, PermissionsExt};
     use std::time::Duration;
 
     /// Removes the index cache this test created under the real OS cache dir, even on panic.
@@ -285,7 +302,7 @@ mod tests {
 
     fn project() -> (CacheGuard, tempfile::TempDir, PathBuf) {
         let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().canonicalize().unwrap();
+        let root = crate::xfer::canonical(dir.path()).unwrap();
         (CacheGuard(Index::cache_path(&root)), dir, root)
     }
 
@@ -372,7 +389,9 @@ mod tests {
         write(&root, "b.txt", b"bee");
         write(&root, "a/z.txt", b"zed!");
         write(&root, "a/b/c.sh", b"#!/bin/sh\n");
+        #[cfg(unix)]
         fs::set_permissions(root.join("a/b/c.sh"), fs::Permissions::from_mode(0o755)).unwrap();
+        #[cfg(unix)]
         fs::set_permissions(root.join("b.txt"), fs::Permissions::from_mode(0o644)).unwrap();
         fs::create_dir_all(root.join("empty/deeper")).unwrap();
 
@@ -386,10 +405,11 @@ mod tests {
             assert_eq!(e.mtime_ns, mtime_ns(&fs::metadata(root.join(&e.path)).unwrap()));
         }
         assert_eq!(find(&entries, "a/b/c.sh").mode & 0o7777, 0o755);
-        assert_eq!(find(&entries, "b.txt").mode & 0o7777, 0o644);
+        assert_eq!(find(&entries, "b.txt").mode & 0o7777, if cfg!(unix) { 0o644 } else { 0o755 });
     }
 
     #[test]
+    #[cfg(unix)]
     fn symlinks_are_entries_with_the_hash_of_their_target_even_when_dangling() {
         let (_g, _d, root) = project();
         write(&root, "real.txt", b"content");
@@ -407,6 +427,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn symlink_to_a_directory_is_not_followed() {
         let (_g, _d, root) = project();
         write(&root, "real/inner.txt", b"x");
@@ -537,7 +558,7 @@ mod tests {
         index.remember("b.txt", 1, 2, [3; 32]);
         index.save();
         assert!(!g.0.with_extension("tmp").exists());
-        let cache: Cache = bincode::deserialize(&fs::read(&g.0).unwrap()).unwrap();
+        let cache: Cache = postcard::from_bytes(&fs::read(&g.0).unwrap()).unwrap();
         assert_eq!(cache.files.get("b.txt"), Some(&(1, 2, [3; 32])));
         assert!(cache.files.contains_key("a.txt"));
     }
@@ -549,6 +570,7 @@ mod tests {
         assert_eq!(rel_path(root, root), "");
         assert_eq!(rel_path(root, Path::new("other/x")), "other/x");
         // outside the root the path is returned whole; the root component joins as an extra `/`
+        #[cfg(unix)]
         assert_eq!(rel_path(root, Path::new("/elsewhere/x")), "//elsewhere/x");
     }
 
@@ -565,6 +587,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn an_unreadable_directory_is_skipped_not_an_error() {
         if unsafe { libc::geteuid() } == 0 {
             return; // root reads everything

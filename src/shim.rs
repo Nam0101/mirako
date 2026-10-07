@@ -1,6 +1,7 @@
 //! The Gradle init script that makes Android Studio / `./gradlew` builds go through `mirako`.
 
 use crate::config;
+use crate::xfer::canonical;
 use anyhow::{Context, Result};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -107,9 +108,11 @@ fn script_path() -> Result<PathBuf> {
         .join("mirako.gradle"))
 }
 
-/// This executable's canonical path, the one written into the script.
+/// This executable's canonical path, the one written into the script. With `/` on Windows too:
+/// a `\` is an escape inside the script's Groovy string.
 pub fn this_binary() -> Result<String> {
-    Ok(std::env::current_exe()?.canonicalize()?.to_string_lossy().into_owned())
+    let exe = canonical(&std::env::current_exe()?)?.to_string_lossy().into_owned();
+    Ok(if cfg!(windows) { exe.replace('\\', "/") } else { exe })
 }
 
 pub fn install() -> Result<PathBuf> {

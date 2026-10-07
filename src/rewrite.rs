@@ -4,14 +4,23 @@
 pub struct LineRewriter {
     from: Vec<u8>,
     to: Vec<u8>,
+    /// `to` as it stands behind `file://`
+    to_url: Vec<u8>,
     buf: Vec<u8>,
 }
 
 impl LineRewriter {
     pub fn new(from: &str, to: &str) -> Self {
+        // a Windows path is `/C:/…` in a URL: kotlinc prints `file:///C:/…`, the host `file:///Users/…`
+        let to_url = if to.starts_with('/') {
+            to.to_string()
+        } else {
+            format!("/{}", to.replace('\\', "/"))
+        };
         Self {
             from: from.as_bytes().to_vec(),
             to: to.as_bytes().to_vec(),
+            to_url: to_url.into_bytes(),
             buf: Vec::new(),
         }
     }
@@ -45,7 +54,8 @@ impl LineRewriter {
         let mut i = 0;
         while i < data.len() {
             if data[i..].starts_with(&self.from) {
-                out.extend_from_slice(&self.to);
+                let to = if out.ends_with(b"file://") { &self.to_url } else { &self.to };
+                out.extend_from_slice(to);
                 i += self.from.len();
             } else {
                 out.push(data[i]);
@@ -140,6 +150,24 @@ mod tests {
     fn every_occurrence_on_a_line_is_replaced() {
         let mut r = LineRewriter::new("/r/p", "/l");
         assert_eq!(all(&mut r, &[b"/r/p/a /r/p/b:/r/p/r/p\n"]), b"/l/a /l/b:/l/l\n");
+    }
+
+    #[test]
+    fn a_windows_root_becomes_a_slash_path_inside_a_file_url_only() {
+        let mut r = LineRewriter::new("/Users/admin/mirako/app", r"C:\Users\me\app");
+        let out = all(
+            &mut r,
+            &[b"e: file:///Users/admin/mirako/app/src/A.kt:3:1 boom\n/Users/admin/mirako/app/B.java:7: error\n"],
+        );
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "e: file:///C:/Users/me/app/src/A.kt:3:1 boom\nC:\\Users\\me\\app/B.java:7: error\n"
+        );
+        // a Unix root reads the same in both places
+        assert_eq!(
+            all(&mut LineRewriter::new("/r", "/l"), &[b"file:///r/a /r/b\n"]),
+            b"file:///l/a /l/b\n"
+        );
     }
 
     #[test]

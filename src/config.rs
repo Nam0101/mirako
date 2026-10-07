@@ -1,5 +1,6 @@
 //! `~/.config/mirako/config.toml` (global) overlaid by `<project>/mirako.toml`.
 
+use crate::xfer::canonical;
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 use std::fs;
@@ -169,9 +170,7 @@ pub fn sample_global(host: &str) -> String {
 
 /// Nearest ancestor of `start` holding `mirako.toml`, `gradlew` or `.git`.
 pub fn find_project_root(start: &Path) -> Result<PathBuf> {
-    let start = start
-        .canonicalize()
-        .with_context(|| format!("{} does not exist", start.display()))?;
+    let start = canonical(start).with_context(|| format!("{} does not exist", start.display()))?;
     let mut dir = Some(start.as_path());
     while let Some(d) = dir {
         for marker in ["mirako.toml", "gradlew", ".git"] {
@@ -390,7 +389,7 @@ mod tests {
     /// A canonical temp dir: on macOS temp dirs live under /private/var, `find_project_root` canonicalizes.
     fn canon_tempdir() -> (TempDir, PathBuf) {
         let dir = tempfile::tempdir().unwrap();
-        let canon = dir.path().canonicalize().unwrap();
+        let canon = canonical(dir.path()).unwrap();
         (dir, canon)
     }
 

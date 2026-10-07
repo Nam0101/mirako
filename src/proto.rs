@@ -1,5 +1,5 @@
 //! Wire protocol between the local client and the `mirako serve` agent on the remote.
-//! Frames are `u32` big-endian length + bincode payload, in both directions over ssh stdio.
+//! Frames are `u32` big-endian length + postcard payload, in both directions over ssh stdio.
 //!
 //! Transfers are pipelined: the sender streams `Put`/`Delta` frames without waiting and only
 //! `Flush` is answered, so the round-trip latency of the link is paid once per phase, not per file.
@@ -226,7 +226,7 @@ pub fn decompress(z: &[u8]) -> Result<Vec<u8>> {
 }
 
 pub fn write_frame<W: Write, T: Serialize>(w: &mut W, msg: &T) -> Result<()> {
-    let bytes = bincode::serialize(msg)?;
+    let bytes = postcard::to_stdvec(msg)?;
     let len = u32::try_from(bytes.len()).context("frame too large")?;
     w.write_all(&len.to_be_bytes())?;
     w.write_all(&bytes)?;
@@ -242,7 +242,7 @@ pub fn read_frame<R: Read, T: DeserializeOwned>(r: &mut R) -> Result<T> {
     }
     let mut buf = vec![0u8; len as usize];
     r.read_exact(&mut buf)?;
-    Ok(bincode::deserialize(&buf)?)
+    Ok(postcard::from_bytes(&buf)?)
 }
 
 #[cfg(test)]

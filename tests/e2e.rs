@@ -5,6 +5,8 @@
 //! Hermetic: every child runs with `HOME` and `GRADLE_USER_HOME` inside the test's scratch dir, so
 //! the global config, both index caches and the Gradle retention script never touch the real ones.
 
+#![cfg(unix)] // the loopback "ssh" is `sh`, and the sandbox is `HOME`
+
 use std::fs;
 use std::os::unix::fs::{symlink, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -93,6 +95,8 @@ impl Scratch {
             .current_dir(&self.path)
             .env("HOME", self.home())
             .env("GRADLE_USER_HOME", self.gradle_home())
+            // on Linux the cache dir follows this one before `HOME`
+            .env_remove("XDG_CACHE_HOME")
             .env_remove("MIRAKO_LOCAL")
             .env_remove("MIRAKO_REMOTE")
             .env_remove("PWD")
@@ -560,6 +564,30 @@ fn a_missing_agent_is_installed_on_the_first_handshake() {
     assert_eq!(o.status.code(), Some(0), "{}", show(&o));
     assert!(!stderr(&o).contains("installing"), "{}", show(&o));
     p.run_ok(&[], &["true"]);
+}
+
+/// An agent from before the frames were postcard cannot decode the `Hello` and exits 0 in silence.
+#[test]
+fn an_agent_that_leaves_without_answering_is_replaced() {
+    let s = Scratch::new();
+    let fake = fake_ssh(&s);
+    let agent = s.path.join("agent/mirako");
+    fs::create_dir_all(agent.parent().unwrap()).unwrap();
+    fs::write(&agent, "#!/bin/sh\nexit 0\n").unwrap();
+    fs::set_permissions(&agent, fs::Permissions::from_mode(0o755)).unwrap();
+    let p = s.project(
+        "app",
+        &format!(
+            "ssh = [\"sh\", {:?}]\nremote_bin = {:?}",
+            fake.to_str().unwrap(),
+            agent.to_str().unwrap()
+        ),
+    );
+    let o = p.sub("check", &[]);
+    assert_eq!(o.status.code(), Some(0), "{}", show(&o));
+    assert!(stderr(&o).contains("does not answer the handshake"), "{}", show(&o));
+    assert!(stdout(&o).contains(" ok ("), "{}", show(&o));
+    assert_eq!(fs::read(&agent).unwrap(), fs::read(BIN).unwrap());
 }
 
 #[test]

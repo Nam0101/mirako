@@ -6,6 +6,7 @@ use crate::index::{self, Index};
 use crate::patterns::Matcher;
 use crate::proto::{GcReport, GcReq, Mirror};
 use crate::server::expand_home;
+use crate::xfer::canonical;
 use anyhow::{Context, Result};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -16,7 +17,7 @@ const DAY: u64 = 86_400;
 
 pub fn collect(req: &GcReq) -> Result<GcReport> {
     let folder = expand_home(&req.folder);
-    let current = req.current.as_deref().map(expand_home).and_then(|p| p.canonicalize().ok());
+    let current = req.current.as_deref().map(expand_home).and_then(|p| canonical(&p).ok());
     let mut report = GcReport::default();
 
     let mut dirs: Vec<PathBuf> = match fs::read_dir(&folder) {
@@ -33,8 +34,7 @@ pub fn collect(req: &GcReq) -> Result<GcReport> {
         let name = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
         // the agent's index cache for a root exists iff mirako has synced it, and its mtime is
         // the last sync (`Index::save` touches it even when nothing changed)
-        let last = path
-            .canonicalize()
+        let last = canonical(&path)
             .ok()
             .map(|canon| (Index::cache_path(&canon), canon))
             .and_then(|(idx, canon)| fs::metadata(&idx).and_then(|m| m.modified()).ok().map(|t| (idx, canon, t)));
@@ -181,6 +181,7 @@ pub fn gradle_retention(home: &Path, days: u32) -> Result<()> {
 }
 
 /// Free bytes on the volume holding `p` (0 when unknown).
+#[cfg(unix)]
 #[allow(clippy::unnecessary_cast)] // the field types differ between macOS and Linux
 fn free_space(p: &Path) -> u64 {
     use std::os::unix::ffi::OsStrExt;
@@ -193,6 +194,12 @@ fn free_space(p: &Path) -> u64 {
         return 0;
     }
     st.f_bavail as u64 * st.f_frsize as u64
+}
+
+/// Unknown on Windows, which is a client: the builds, and so this housekeeping, run on a Unix host.
+#[cfg(not(unix))]
+fn free_space(_: &Path) -> u64 {
+    0
 }
 
 #[cfg(test)]
@@ -218,7 +225,7 @@ mod tests {
 
     fn canon_tempdir() -> (TempDir, PathBuf) {
         let dir = tempfile::tempdir().unwrap();
-        let canon = dir.path().canonicalize().unwrap();
+        let canon = canonical(dir.path()).unwrap();
         (dir, canon)
     }
 
@@ -241,7 +248,7 @@ mod tests {
 
     impl Synced {
         fn new(dir: &Path, idle_days: u64) -> Self {
-            let canon = dir.canonicalize().unwrap();
+            let canon = canonical(dir).unwrap();
             Index::open(&canon).save();
             let idx = Index::cache_path(&canon);
             assert!(idx.exists());
@@ -264,6 +271,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn dir_size_sums_files_recursively_without_following_symlinks() {
         let (_d, t) = canon_tempdir();
         write(&t.join("d/a"), 10);
@@ -392,6 +400,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn free_space_is_positive_for_a_real_dir_and_zero_for_a_missing_one() {
         let (_d, t) = canon_tempdir();
         assert!(free_space(&t) > 0);
@@ -446,6 +455,7 @@ mod tests {
         .unwrap();
         let m = &r.mirrors[0];
         assert_eq!((m.idle_days, m.removed, m.bytes), (Some(0), false, 42));
+        #[cfg(unix)]
         assert!(r.free > 0);
     }
 
@@ -512,6 +522,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn files_and_symlinked_dirs_in_the_folder_are_ignored() {
         isolate_gradle();
         let (_d, t) = canon_tempdir();
@@ -593,6 +604,7 @@ mod tests {
         let r = collect(&req(&t)).unwrap();
         let names: Vec<&str> = r.mirrors.iter().map(|m| m.name.as_str()).collect();
         assert_eq!(names, ["Beta", "alpha", "mid", "zeta"]);
+        #[cfg(unix)]
         assert!(r.free > 0);
     }
 }
