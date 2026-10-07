@@ -7,8 +7,9 @@ use crate::patterns::Matcher;
 use crate::proto::{self, read_frame, write_frame, Chunk, DeltaChunk, Entry, GcReport, GcReq, Kind, Req, Resp, CHUNK};
 use crate::rewrite::LineRewriter;
 use crate::server::read_full;
+use crate::shim;
 use crate::xfer::Inbox;
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{bail, Context, Result};
 use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -30,6 +31,15 @@ pub struct Session {
     pub remote_os: String,
 }
 
+/// One try at `Session::connect`: up, or why the agent needs (re)installing first.
+enum Attempt {
+    Up(Session),
+    /// the remote shell exited 127: no `remote_bin` there
+    Missing,
+    /// the agent answered with this other version
+    Version(String),
+}
+
 #[derive(Default)]
 pub struct Stats {
     pub files: usize,
@@ -42,7 +52,24 @@ pub struct Stats {
 impl Session {
     /// Starts `mirako serve` over ssh and shakes hands. `first` goes out in the same write as
     /// the `Hello`, so the agent is already working on it while the reply crosses the link.
+    /// `ssh host 'mirako serve'` plus the handshake. When the agent is missing there or runs
+    /// another version, this binary is installed as `remote_bin` and the connection retried once.
     pub fn connect(cfg: &Config, first: Option<&Req>) -> Result<Self> {
+        let why = match Self::attempt(cfg, first)? {
+            Attempt::Up(s) => return Ok(s),
+            Attempt::Missing => format!("no `{}` on {}", cfg.remote_bin, cfg.host),
+            Attempt::Version(v) => format!("remote mirako is {v}, local is {}", proto::VERSION),
+        };
+        eprintln!("mirako: {why}: installing mirako {} there", proto::VERSION);
+        remote_install(cfg).with_context(|| format!("{why}; installing it failed, try `mirako remote-install`"))?;
+        match Self::attempt(cfg, first)? {
+            Attempt::Up(s) => Ok(s),
+            Attempt::Missing => bail!("still no `{}` on {} right after installing it", cfg.remote_bin, cfg.host),
+            Attempt::Version(v) => bail!("remote mirako is still {v} right after installing {}", proto::VERSION),
+        }
+    }
+
+    fn attempt(cfg: &Config, first: Option<&Req>) -> Result<Attempt> {
         let mut cmd = Command::new(&cfg.ssh[0]);
         cmd.args(&cfg.ssh[1..])
             .args(SSH_OPTS)
@@ -69,29 +96,35 @@ impl Session {
             writer.flush()?;
             read_frame(&mut reader)
         })();
-        let hello = handshake.map_err(|e| {
-            let _ = child.wait();
-            anyhow!(
-                "no answer from `{} serve` on {} ({e}). Is the host reachable and mirako installed there? Try `mirako remote-install`.",
-                cfg.remote_bin,
-                cfg.host
-            )
-        })?;
+        let hello = match handshake {
+            Ok(hello) => hello,
+            Err(e) => {
+                // the remote shell could not run `remote_bin`: 127 not found, 126 not executable
+                if matches!(child.wait().ok().and_then(|s| s.code()), Some(126 | 127)) {
+                    return Ok(Attempt::Missing);
+                }
+                bail!(
+                    "no answer from `{} serve` on {} ({e}). Is the host reachable and mirako installed there? Try `mirako remote-install`.",
+                    cfg.remote_bin,
+                    cfg.host
+                );
+            }
+        };
         match hello {
             Resp::Hello { version, home, os } => {
                 if version != proto::VERSION {
-                    bail!(
-                        "remote mirako is {version}, local is {}: run `mirako remote-install`",
-                        proto::VERSION
-                    );
+                    // a 0.4+ agent exits on its own here; an older one is still waiting for a frame
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Ok(Attempt::Version(version));
                 }
-                Ok(Self {
+                Ok(Attempt::Up(Self {
                     child,
                     reader,
                     writer,
                     remote_home: home,
                     remote_os: os,
-                })
+                }))
             }
             Resp::Error { msg } => bail!("remote: {msg}"),
             other => bail!("unexpected handshake reply {other:?}"),
@@ -459,6 +492,7 @@ fn secs(t: Instant) -> String {
 /// The whole round trip. Returns the exit code to end the process with.
 pub fn run(root: &Path, cfg: &Config, cmd: &[String], opts: &RunOptions) -> Result<i32> {
     let start = Instant::now();
+    refresh_shim();
     let remote_dir = cfg.remote_dir(root);
     let push_excludes = cfg.upload_excludes();
     let pull_excludes = cfg.download_excludes();
@@ -663,8 +697,18 @@ pub fn run_local(root: &Path, cmd: &[String]) -> Result<i32> {
     Ok(status.code().unwrap_or(-1))
 }
 
+/// The installed Gradle init script follows this binary: rewritten when it is this binary's and out of date.
+fn refresh_shim() {
+    match shim::refresh() {
+        Ok(Some(p)) => eprintln!("mirako: updated {}", p.display()),
+        Ok(None) => {}
+        Err(e) => eprintln!("mirako: gradle shim: {e:#}"),
+    }
+}
+
 /// Quick reachability + version handshake; used by the Gradle shim before hijacking a build.
 pub fn check(cfg: &Config) -> Result<()> {
+    refresh_shim();
     let s = Session::connect(cfg, None)?;
     let os = s.remote_os.clone();
     s.close();

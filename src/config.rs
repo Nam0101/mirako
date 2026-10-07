@@ -22,6 +22,8 @@ pub struct FileConfig {
     pub exclude_common_extra: Option<Vec<String>>,
     pub gc_days: Option<u32>,
     pub gc_after_pull: Option<Vec<String>>,
+    /// global only: whether the Gradle init script runs `mirako check` before taking a build (default true)
+    pub shim_check: Option<bool>,
 }
 
 #[derive(Debug, Clone)]
@@ -79,6 +81,13 @@ impl Config {
     pub fn load_from(global: &Path, project_root: &Path, host_override: Option<&str>) -> Result<Self> {
         let g = read(global)?;
         let p = read(&project_root.join("mirako.toml"))?;
+        if p.shim_check.is_some() {
+            bail!(
+                "`shim_check` belongs in {} (the init script is one per machine), not in {}",
+                global.display(),
+                project_root.join("mirako.toml").display()
+            );
+        }
         let pick = |a: Option<String>, b: Option<String>| b.or(a);
         let list = |def: &[&str], a: Option<Vec<String>>, b: Option<Vec<String>>, ea: Option<Vec<String>>, eb: Option<Vec<String>>| {
             let mut v = b.or(a).unwrap_or_else(|| def.iter().map(|s| s.to_string()).collect());
@@ -144,6 +153,20 @@ impl Config {
     }
 }
 
+/// `shim_check` of the global config (no host needed): whether the Gradle init script handshakes first.
+pub fn shim_check() -> Result<bool> {
+    shim_check_from(&global_config_path())
+}
+
+pub fn shim_check_from(global: &Path) -> Result<bool> {
+    Ok(read(global)?.shim_check.unwrap_or(true))
+}
+
+/// `SAMPLE_GLOBAL_TOML` with `host` filled in.
+pub fn sample_global(host: &str) -> String {
+    SAMPLE_GLOBAL_TOML.replacen("host = \"m4\"", &format!("host = \"{host}\""), 1)
+}
+
 /// Nearest ancestor of `start` holding `mirako.toml`, `gradlew` or `.git`.
 pub fn find_project_root(start: &Path) -> Result<PathBuf> {
     let start = start
@@ -184,6 +207,7 @@ remote_bin = "~/.local/bin/mirako"
 fallback = true                  # run locally when the host is unreachable
 gc_days = 7                      # remove a project's remote copy unused for this long (Gradle's caches there too); 0 = never
 # gc_after_pull = ["build/intermediates", "build/tmp"]   # deleted on the remote after every pull: saves disk, costs a clean build next time
+# shim_check = false             # Gradle shim: skip the ~0.1 s handshake before each build (a dead host then fails, or falls back, inside `mirako run`)
 # ssh = ["ssh", "-o", "BatchMode=yes"]
 # exclude_local  = ["build"]
 # exclude_remote = ["src"]
@@ -435,6 +459,26 @@ mod tests {
         assert_eq!(g.host.as_deref(), Some("m4"));
         assert_eq!(g.gc_days, Some(7));
         assert_eq!(g.fallback, Some(true));
+    }
+
+    #[test]
+    fn shim_check_defaults_to_true_and_comes_from_the_global_file_only() {
+        let s = Setup::new();
+        assert!(shim_check_from(&s.global).unwrap());
+        let s = s.global("shim_check = false\n");
+        assert!(!shim_check_from(&s.global).unwrap());
+        assert!(s.load(Some("h")).is_ok());
+        let s = s.project("shim_check = true\n");
+        let msg = format!("{:#}", s.load(Some("h")).unwrap_err());
+        assert!(msg.contains("shim_check") && msg.contains(&s.global.display().to_string()), "{msg}");
+    }
+
+    #[test]
+    fn sample_global_fills_in_the_host() {
+        let g = toml::from_str::<FileConfig>(&sample_global("buildbox")).unwrap();
+        assert_eq!(g.host.as_deref(), Some("buildbox"));
+        assert_eq!(g.gc_days, Some(7));
+        assert_eq!(sample_global("m4"), SAMPLE_GLOBAL_TOML);
     }
 
     #[test]

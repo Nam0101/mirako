@@ -1,7 +1,8 @@
-use anyhow::Result;
+use anyhow::{bail, Result};
 use clap::{Parser, Subcommand};
 use mirako::config::{self, Config};
 use mirako::{client, server, shim};
+use std::fs;
 use std::path::PathBuf;
 
 /// Remote builds: sync the project to another machine over ssh, run the command there, pull the outputs back.
@@ -61,6 +62,12 @@ enum Cmd {
         #[arg(long)]
         host: Option<String>,
     },
+    /// first run: write the global config, install the Gradle init script, put the agent on the host, handshake
+    Setup {
+        /// ssh host or alias; required the first time (written into the global config)
+        #[arg(long)]
+        host: Option<String>,
+    },
     /// write sample config files (global and/or per-project)
     Init {
         /// write <project>/mirako.toml
@@ -117,6 +124,28 @@ fn load(project: Option<&PathBuf>, host: Option<&str>) -> Result<(PathBuf, Confi
     let root = client::project_root_for(project)?;
     let cfg = Config::load(&root, host)?;
     Ok((root, cfg))
+}
+
+/// `mirako setup [--host H]`: everything a new machine needs, each step idempotent.
+fn setup(host: Option<&str>) -> Result<i32> {
+    let global = config::global_config_path();
+    if global.exists() {
+        println!("{} exists", global.display());
+    } else {
+        let Some(host) = host else {
+            bail!("no {} yet: pass --host <ssh host or alias> the first time", global.display());
+        };
+        fs::create_dir_all(global.parent().unwrap())?;
+        fs::write(&global, config::sample_global(host))?;
+        println!("wrote {} (host = {host})", global.display());
+    }
+    println!("wrote {}", shim::install()?.display());
+    // works outside a project too: the global config names the host
+    let root = client::project_root_for(None).unwrap_or_else(|_| PathBuf::from("."));
+    let cfg = Config::load(&root, host)?;
+    // the handshake installs or updates the agent on the host when needed
+    client::check(&cfg)?;
+    Ok(0)
 }
 
 fn real_main() -> Result<i32> {
@@ -200,6 +229,7 @@ fn real_main() -> Result<i32> {
             client::remote_install(&cfg)?;
             Ok(0)
         }
+        Some(Cmd::Setup { host }) => setup(host.as_deref()),
         Some(Cmd::Init { project, global }) => {
             if global {
                 let p = config::global_config_path();
@@ -238,7 +268,7 @@ fn real_main() -> Result<i32> {
         Some(Cmd::GradleShim { what }) => {
             match what {
                 ShimCmd::Install => println!("wrote {}", shim::install()?.display()),
-                ShimCmd::Print => print!("{}", shim::init_script(&std::env::current_exe()?.to_string_lossy())),
+                ShimCmd::Print => print!("{}", shim::init_script(&shim::this_binary()?, config::shim_check()?)),
             }
             Ok(0)
         }

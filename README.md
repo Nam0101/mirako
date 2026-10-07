@@ -33,14 +33,16 @@ build outputs back. It is a single Rust binary, installed on both ends, in the s
 
 ```
 cargo install --git https://github.com/Nam0101/mirako
+mirako setup --host m4                   # global config, Gradle init script, agent on the host, handshake
 ```
 
-On the remote, either run the same command or, when both machines share the OS and
-architecture (e.g. two Apple-silicon Macs):
-
-```
-mirako remote-install --host m4          # copies this binary to ~/.local/bin/mirako there
-```
+`setup` copies this binary to `~/.local/bin/mirako` on the host (`remote_bin`), which works when
+both machines share the OS and architecture (e.g. two Apple-silicon Macs); otherwise run the
+`cargo install` there too. From then on the client keeps both in step: a handshake that finds
+no agent, or one of another version, installs this binary there and retries, and `mirako run`
+rewrites the Gradle init script when it is out of date, so after a `cargo install` nothing else
+is needed. The pieces on their own: `mirako init --global`, `mirako gradle-shim install`,
+`mirako remote-install --host m4`.
 
 The remote needs whatever the command needs (JDK, Android SDK, …) reachable from a
 non-interactive ssh shell. On macOS put `JAVA_HOME`/`ANDROID_HOME`/`PATH` in `~/.zshenv`.
@@ -56,6 +58,7 @@ remote_bin = "~/.local/bin/mirako"
 fallback = true                  # run locally when the host is unreachable
 gc_days = 7                      # remove a project's remote copy unused for this long (Gradle's caches there too); 0 = never
 # gc_after_pull = ["build/intermediates", "build/tmp"]   # deleted on the remote after every pull: saves disk, costs a clean build next time
+# shim_check = false             # Gradle shim: skip the ~0.1 s handshake before each build (a dead host then fails, or falls back, inside `mirako run`)
 # ssh = ["ssh", "-o", "BatchMode=yes"]
 # exclude_local  = ["build"]
 # exclude_remote = ["src"]
@@ -110,7 +113,7 @@ between builds; the handshake then costs ~70 ms.
 ## Android Studio / `./gradlew`
 
 ```
-mirako gradle-shim install     # writes ~/.gradle/init.d/mirako.gradle
+mirako gradle-shim install     # writes ~/.gradle/init.d/mirako.gradle (`mirako setup` does this too)
 ```
 
 From then on every Gradle build on this machine, including the ones Android Studio starts,
@@ -122,7 +125,12 @@ finishes.
 - one build locally: `./gradlew <task> -x mirako` (or `-Pmirako.disabled`)
 - `updateDaemonJvm` and `wrapper` (they edit the project's Gradle config) always run locally
 - one project always local: `mirako.enabled=false` in its `local.properties`
-- host unreachable: the build simply runs locally
+- host unreachable: the build simply runs locally. The script asks `mirako check` first (one
+  handshake, ~0.1 s); `shim_check = false` in the global config skips that, and a dead host then
+  fails the build, or with `fallback = true` runs it locally inside `mirako run`
+- the script follows the binary: `mirako run`/`check` rewrite it when this binary's copy of it
+  is out of date (after a `cargo install`, or a `shim_check` change); a mirako started from
+  another path never touches it
 - back to local builds for good: delete `~/.gradle/init.d/mirako.gradle`
 
 ## How it works

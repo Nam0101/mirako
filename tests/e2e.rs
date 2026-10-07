@@ -523,3 +523,74 @@ fn a_project_without_host_fails_clearly() {
     assert_eq!(o.status.code(), Some(2), "{}", show(&o));
     assert!(stderr(&o).contains("no host configured"), "{}", show(&o));
 }
+
+/// A stand-in for `ssh` whose last argument is the remote command, like ssh's: `uname -sm` and
+/// the install script run locally, `<bin> serve` is exec'd (exit 126/127 while `<bin>` is missing).
+fn fake_ssh(s: &Scratch) -> PathBuf {
+    let path = s.path.join("fakessh.sh");
+    fs::write(
+        &path,
+        "#!/bin/sh\nfor last; do :; done\ncase \"$last\" in\n  \"uname -sm\") uname -sm ;;\n  *\" serve\") exec $last ;;\n  *) exec sh -c \"$last\" ;;\nesac\n",
+    )
+    .unwrap();
+    path
+}
+
+#[test]
+fn a_missing_agent_is_installed_on_the_first_handshake() {
+    let s = Scratch::new();
+    let fake = fake_ssh(&s);
+    let agent = s.path.join("agent/mirako");
+    let p = s.project(
+        "app",
+        &format!(
+            "ssh = [\"sh\", {:?}]\nremote_bin = {:?}",
+            fake.to_str().unwrap(),
+            agent.to_str().unwrap()
+        ),
+    );
+    let o = p.sub("check", &[]);
+    assert_eq!(o.status.code(), Some(0), "{}", show(&o));
+    assert!(stderr(&o).contains("installing mirako"), "{}", show(&o));
+    assert!(stdout(&o).contains(" ok ("), "{}", show(&o));
+    assert_eq!(fs::read(&agent).unwrap(), fs::read(BIN).unwrap());
+
+    // installed: the next handshake is silent, and a run goes through
+    let o = p.sub("check", &[]);
+    assert_eq!(o.status.code(), Some(0), "{}", show(&o));
+    assert!(!stderr(&o).contains("installing"), "{}", show(&o));
+    p.run_ok(&[], &["true"]);
+}
+
+#[test]
+fn the_installed_init_script_follows_this_binary_and_shim_check() {
+    let s = Scratch::new();
+    let p = s.project("app", "");
+    let script = s.home().join(".gradle/init.d/mirako.gradle");
+    fs::create_dir_all(script.parent().unwrap()).unwrap();
+    let current = stdout(&s.mirako(&["gradle-shim", "print"]));
+    assert!(current.contains("\"check\"") && current.contains(BIN), "{current}");
+
+    // a stale script of this binary is rewritten by the next check or run
+    fs::write(&script, current.replace("def args = []", "def args = [] // stale")).unwrap();
+    let o = p.sub("check", &[]);
+    assert_eq!(o.status.code(), Some(0), "{}", show(&o));
+    assert!(stderr(&o).contains("updated"), "{}", show(&o));
+    assert_eq!(fs::read_to_string(&script).unwrap(), current);
+
+    // `shim_check = false` in the global config drops the handshake from it
+    let global = s.home().join(".config/mirako/config.toml");
+    fs::create_dir_all(global.parent().unwrap()).unwrap();
+    fs::write(&global, "shim_check = false\n").unwrap();
+    p.run_ok(&[], &["true"]);
+    let now = fs::read_to_string(&script).unwrap();
+    assert!(!now.contains("\"check\"") && now.contains("shim_check = false"), "{now}");
+
+    // another binary's script, stale or not, is left alone
+    let other = current.replace(BIN, "/elsewhere/mirako").replace("def args = []", "// stale");
+    fs::write(&script, &other).unwrap();
+    let o = p.sub("check", &[]);
+    assert_eq!(o.status.code(), Some(0), "{}", show(&o));
+    assert!(!stderr(&o).contains("updated"), "{}", show(&o));
+    assert_eq!(fs::read_to_string(&script).unwrap(), other);
+}
