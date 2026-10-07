@@ -1,18 +1,7 @@
-mod client;
-mod config;
-mod delta;
-mod gc;
-mod index;
-mod patterns;
-mod proto;
-mod rewrite;
-mod server;
-mod shim;
-mod xfer;
-
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use config::Config;
+use mirako::config::{self, Config};
+use mirako::{client, server, shim};
 use std::path::PathBuf;
 
 /// Remote builds: sync the project to another machine over ssh, run the command there, pull the outputs back.

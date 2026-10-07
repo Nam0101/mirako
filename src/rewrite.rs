@@ -71,4 +71,96 @@ mod tests {
             "e: /Users/me/app/src/A.kt: boom\nnext /Users/me/app/x\n"
         );
     }
+
+    fn all(r: &mut LineRewriter, chunks: &[&[u8]]) -> Vec<u8> {
+        let mut out = Vec::new();
+        for c in chunks {
+            out.extend(r.feed(c));
+        }
+        out.extend(r.flush());
+        out
+    }
+
+    #[test]
+    fn a_chunk_without_a_newline_is_held_back_until_flush() {
+        let mut r = LineRewriter::new("/remote", "/local");
+        assert!(r.feed(b"at /remote/a.kt").is_empty());
+        assert!(r.feed(b" still going").is_empty());
+        assert_eq!(r.flush(), b"at /local/a.kt still going");
+        assert!(r.flush().is_empty());
+    }
+
+    #[test]
+    fn only_complete_lines_are_returned_and_the_tail_waits() {
+        let mut r = LineRewriter::new("/remote", "/local");
+        assert_eq!(r.feed(b"1 /remote\n2 /rem"), b"1 /local\n");
+        assert_eq!(r.feed(b"ote\n3"), b"2 /local\n");
+        assert_eq!(r.flush(), b"3");
+    }
+
+    #[test]
+    fn more_than_64_kib_without_a_newline_is_flushed_anyway_and_rewritten() {
+        let mut r = LineRewriter::new("/remote", "/local");
+        let mut big = b"/remote ".to_vec();
+        big.resize(64 * 1024 + 1, b'.');
+        let out = r.feed(&big);
+        assert!(out.starts_with(b"/local "));
+        assert_eq!(out.len(), big.len() - 1);
+        assert!(r.flush().is_empty());
+    }
+
+    #[test]
+    fn a_path_split_by_the_64_kib_forced_flush_is_not_rewritten() {
+        // current behaviour: the forced flush does not keep a possible prefix of `from` back
+        let mut r = LineRewriter::new("/remote", "/local");
+        let mut big = vec![b'.'; 64 * 1024 - 2];
+        big.extend_from_slice(b"/rem");
+        let mut out = r.feed(&big);
+        out.extend(r.feed(b"ote\n"));
+        assert!(out.ends_with(b"/remote\n"));
+    }
+
+    #[test]
+    fn identical_or_empty_from_passes_bytes_through_unchanged() {
+        let data: &[u8] = &[0xff, 0xfe, b'/', b'a', b'\n', 0x80, 0x00];
+        assert_eq!(all(&mut LineRewriter::new("/a", "/a"), &[data]), data);
+        assert_eq!(all(&mut LineRewriter::new("", "/x"), &[data]), data);
+    }
+
+    #[test]
+    fn non_utf8_bytes_around_a_match_survive() {
+        let mut r = LineRewriter::new("/remote", "/local");
+        assert_eq!(
+            all(&mut r, &[&[0xff, b'/', b'r'], b"emote", &[0x80, b'\n']]),
+            [&[0xffu8][..], b"/local", &[0x80, b'\n']].concat()
+        );
+    }
+
+    #[test]
+    fn every_occurrence_on_a_line_is_replaced() {
+        let mut r = LineRewriter::new("/r/p", "/l");
+        assert_eq!(all(&mut r, &[b"/r/p/a /r/p/b:/r/p/r/p\n"]), b"/l/a /l/b:/l/l\n");
+    }
+
+    #[test]
+    fn a_prefix_at_a_chunk_boundary_that_does_not_match_is_kept_as_is() {
+        let mut r = LineRewriter::new("/Users/admin", "/Users/me");
+        assert_eq!(
+            all(&mut r, &[b"x /Users/adm", b"ission /Users/admin\n"]),
+            b"x /Users/admission /Users/me\n"
+        );
+    }
+
+    #[test]
+    fn replacement_longer_or_shorter_than_the_original() {
+        assert_eq!(
+            all(&mut LineRewriter::new("/a", "/much/longer/path"), &[b"/a/x\n"]),
+            b"/much/longer/path/x\n"
+        );
+        assert_eq!(
+            all(&mut LineRewriter::new("/much/longer/path", "/a"), &[b"/much/longer/path/x\n"]),
+            b"/a/x\n"
+        );
+        assert_eq!(all(&mut LineRewriter::new("/a", ""), &[b"/a/x\n"]), b"/x\n");
+    }
 }

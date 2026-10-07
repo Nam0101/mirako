@@ -30,3 +30,35 @@ opt-level = 3
 lto = "thin"
 codegen-units = 1
 strip = true
+
+[dev-dependencies]
+criterion = { version = "0.8.2", default-features = false }
+tempfile = "3.27.0"
+
+[[bench]]
+name = "delta"
+harness = false
+
+[[bench]]
+name = "proto"
+harness = false
+
+[[bench]]
+name = "index"
+harness = false
+
+[[bench]]
+name = "patterns"
+harness = false
+
+[[bench]]
+name = "rewrite"
+harness = false
+
+[[bench]]
+name = "gc"
+harness = false
+
+[[bench]]
+name = "e2e"
+harness = false

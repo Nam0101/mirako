@@ -683,3 +683,30 @@ pub fn project_root_for(path: Option<&PathBuf>) -> Result<PathBuf> {
     };
     crate::config::find_project_root(&start)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn human_picks_the_unit_at_each_boundary() {
+        assert_eq!(human(0), "0 B");
+        assert_eq!(human(1023), "1023 B");
+        assert_eq!(human(1024), "1 KB");
+        assert_eq!(human((1 << 20) - 1), "1024 KB");
+        assert_eq!(human(1 << 20), "1.0 MB");
+        assert_eq!(human(3 << 19), "1.5 MB");
+        assert_eq!(human((1 << 30) - 1), "1024.0 MB");
+        assert_eq!(human(1 << 30), "1.0 GB");
+        assert_eq!(human(5 << 29), "2.5 GB");
+    }
+
+    #[test]
+    fn secs_is_seconds_with_one_decimal() {
+        let s = secs(Instant::now());
+        assert!(s.ends_with('s'), "{s}");
+        let num = s.trim_end_matches('s');
+        assert_eq!(num.split('.').nth(1).map(str::len), Some(1), "{s}");
+        assert!(num.parse::<f64>().unwrap() < 1.0);
+    }
+}

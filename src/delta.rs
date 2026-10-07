@@ -239,9 +239,8 @@ mod tests {
     use std::io::Write;
 
     fn rebuild(old: &[u8], new: &[u8]) -> (Vec<u8>, usize, usize) {
-        let dir = std::env::temp_dir().join(format!("mirako-delta-{}", std::process::id()));
-        fs::create_dir_all(&dir).unwrap();
-        let old_path = dir.join(format!("old-{}", new.len()));
+        let dir = tempfile::tempdir().unwrap();
+        let old_path = dir.path().join("old");
         fs::File::create(&old_path).unwrap().write_all(old).unwrap();
         let sig = signature(&old_path).unwrap();
         let mut ops = Vec::new();
@@ -300,5 +299,244 @@ mod tests {
         let tiny_new = noise(12, 7);
         assert_eq!(rebuild(&tiny_old, &tiny_new).0, tiny_new);
         assert_eq!(rebuild(&old, &[]).0, Vec::<u8>::new());
+    }
+
+    fn old_file(data: &[u8]) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("old");
+        fs::write(&path, data).unwrap();
+        (dir, path)
+    }
+
+    fn head(new: &[u8]) -> DeltaChunk {
+        DeltaChunk {
+            path: "app/build/x.apk".into(),
+            mode: 0o644,
+            mtime_ns: 1_700_000_000_123_456_789,
+            size: new.len() as u64,
+            hash: *blake3::hash(new).as_bytes(),
+            ops: Vec::new(),
+            last: false,
+        }
+    }
+
+    fn op_wire(op: &Op) -> u64 {
+        match op {
+            Op::Data(d) => d.len() as u64,
+            Op::Copy { .. } => 8,
+        }
+    }
+
+    #[test]
+    fn delta_worthwhile_boundaries() {
+        assert!(!delta_worthwhile(0));
+        assert!(!delta_worthwhile(MIN_DELTA_SIZE - 1));
+        assert!(delta_worthwhile(MIN_DELTA_SIZE));
+        assert!(delta_worthwhile(MAX_DELTA_SIZE));
+        assert!(!delta_worthwhile(MAX_DELTA_SIZE + 1));
+    }
+
+    #[test]
+    fn signature_of_an_empty_file_has_no_blocks() {
+        let (_d, path) = old_file(&[]);
+        let sig = signature(&path).unwrap();
+        assert_eq!((sig.block, sig.size), (BLOCK as u32, 0));
+        assert!(sig.blocks.is_empty());
+    }
+
+    #[test]
+    fn signature_counts_whole_blocks_and_a_trailing_partial_one() {
+        let data = noise(3 * BLOCK + 1, 11);
+        let (_d, exact) = old_file(&data[..3 * BLOCK]);
+        let sig = signature(&exact).unwrap();
+        assert_eq!((sig.size, sig.blocks.len()), (3 * BLOCK as u64, 3));
+        let (_d2, plus) = old_file(&data);
+        let sig2 = signature(&plus).unwrap();
+        assert_eq!((sig2.size, sig2.blocks.len()), (3 * BLOCK as u64 + 1, 4));
+        assert_eq!(sig.blocks[..], sig2.blocks[..3]);
+        let (a, b) = weak(&data[3 * BLOCK..]);
+        assert_eq!(sig2.blocks[3], (a | (b << 16), strong(&data[3 * BLOCK..])));
+    }
+
+    #[test]
+    fn rolling_checksum_matches_a_fresh_one_after_every_byte() {
+        let data = noise(BLOCK + 500, 12);
+        let b = BLOCK as u32;
+        let (mut a, mut bb) = weak(&data[..BLOCK]);
+        for i in 0..500 {
+            let out = data[i] as u32;
+            let inn = data[i + BLOCK] as u32;
+            a = a.wrapping_add(inn).wrapping_sub(out) & 0xffff;
+            bb = bb.wrapping_sub(b.wrapping_mul(out)).wrapping_add(a) & 0xffff;
+            assert_eq!((a, bb), weak(&data[i + 1..i + 1 + BLOCK]), "at {i}");
+        }
+    }
+
+    #[test]
+    fn data_shifted_by_one_byte_still_copies_almost_everything() {
+        let old = noise(10 * BLOCK, 13);
+        let mut new = vec![0xAB];
+        new.extend_from_slice(&old);
+        let (out, literal, copies) = rebuild(&old, &new);
+        assert_eq!(out, new);
+        assert!(literal < 100, "literal {literal}");
+        assert_eq!(copies, 1);
+    }
+
+    #[test]
+    fn deletion_append_prepend_and_truncation_rebuild() {
+        let old = noise(12 * BLOCK + 321, 14);
+        let mut deleted = old.clone();
+        deleted.drain(5 * BLOCK + 10..6 * BLOCK + 4000);
+        let mut appended = old.clone();
+        appended.extend(noise(7000, 15));
+        let mut prepended = noise(3000, 16);
+        prepended.extend_from_slice(&old);
+        let truncated = old[..8 * BLOCK + 77].to_vec();
+        for (name, new) in [
+            ("deleted", deleted),
+            ("appended", appended),
+            ("prepended", prepended),
+            ("truncated", truncated),
+        ] {
+            let (out, literal, copies) = rebuild(&old, &new);
+            assert_eq!(out, new, "{name}");
+            assert!(literal < 2 * BLOCK + 8000, "{name} literal {literal}");
+            assert!(copies >= 1, "{name}");
+        }
+    }
+
+    #[test]
+    fn the_trailing_partial_block_of_the_old_file_is_never_a_copy_source() {
+        let old = noise(3 * BLOCK + 100, 17);
+        let mut new = old.clone();
+        let n = new.len();
+        new[n - 100..].copy_from_slice(&noise(100, 18));
+        let (_d, path) = old_file(&old);
+        let sig = signature(&path).unwrap();
+        let mut ops = Vec::new();
+        delta(&new, &sig, |op| {
+            ops.push(op);
+            Ok(())
+        })
+        .unwrap();
+        assert!(ops.iter().all(|o| !matches!(o, Op::Copy { index, count } if index + count > 3)));
+        assert_eq!(rebuild(&old, &new).0, new);
+        // the same old tail, unchanged, is resent as a literal too
+        assert_eq!(rebuild(&old, &old).0, old);
+    }
+
+    #[test]
+    fn stream_splits_a_large_unrelated_file_into_chunk_sized_frames() {
+        let old = noise(2 * BLOCK, 19);
+        let new = noise(10 * 1024 * 1024, 20);
+        let (_d, path) = old_file(&old);
+        let sig = signature(&path).unwrap();
+        let h = head(&new);
+        let mut frames = Vec::new();
+        let wire = stream(&new, &sig, &h, |f| {
+            frames.push(f);
+            Ok(())
+        })
+        .unwrap();
+        assert!(frames.len() >= 3, "{} frames", frames.len());
+        let (last, rest) = frames.split_last().unwrap();
+        assert!(last.last);
+        for f in rest {
+            assert!(!f.last);
+            let data: usize = f.ops.iter().map(|o| if let Op::Data(d) = o { d.len() } else { 0 }).sum();
+            assert!(data >= CHUNK, "frame data {data}");
+        }
+        for f in &frames {
+            assert_eq!(f.path, h.path);
+            assert_eq!((f.mode, f.mtime_ns, f.size, f.hash), (h.mode, h.mtime_ns, h.size, h.hash));
+        }
+        let sum: u64 = frames.iter().flat_map(|f| &f.ops).map(op_wire).sum();
+        assert_eq!(wire, sum);
+
+        let ops: Vec<Op> = frames.into_iter().flat_map(|f| f.ops).collect();
+        let mut out = Vec::new();
+        let mut hasher = blake3::Hasher::new();
+        apply(
+            Some(&mut fs::File::open(&path).unwrap()),
+            old.len() as u64,
+            sig.block,
+            &ops,
+            &mut out,
+            &mut hasher,
+        )
+        .unwrap();
+        assert_eq!(out, new);
+        assert_eq!(*hasher.finalize().as_bytes(), h.hash);
+    }
+
+    #[test]
+    fn stream_of_an_identical_file_is_one_final_frame() {
+        let data = noise(6 * BLOCK, 21);
+        let (_d, path) = old_file(&data);
+        let sig = signature(&path).unwrap();
+        let mut frames = Vec::new();
+        let wire = stream(&data, &sig, &head(&data), |f| {
+            frames.push(f);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(frames.len(), 1);
+        assert!(frames[0].last);
+        assert!(matches!(frames[0].ops[..], [Op::Copy { index: 0, count: 6 }]));
+        assert_eq!(wire, 8);
+    }
+
+    #[test]
+    fn apply_copy_without_an_old_file_errors() {
+        let mut out = Vec::new();
+        let err = apply(
+            None,
+            0,
+            BLOCK as u32,
+            &[Op::Copy { index: 0, count: 1 }],
+            &mut out,
+            &mut blake3::Hasher::new(),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("without an old file"), "{err}");
+    }
+
+    #[test]
+    fn apply_clamps_a_copy_range_past_the_end_of_the_old_file() {
+        let old = noise(3 * BLOCK + 100, 22);
+        let (_d, path) = old_file(&old);
+        let mut out = Vec::new();
+        let ops = [Op::Copy { index: 0, count: 4 }];
+        apply(
+            Some(&mut fs::File::open(&path).unwrap()),
+            old.len() as u64,
+            BLOCK as u32,
+            &ops,
+            &mut out,
+            &mut blake3::Hasher::new(),
+        )
+        .unwrap();
+        assert_eq!(out, old);
+        // a run starting past the end copies nothing
+        let mut out = Vec::new();
+        let ops = [Op::Copy { index: 9, count: 2 }];
+        apply(
+            Some(&mut fs::File::open(&path).unwrap()),
+            old.len() as u64,
+            BLOCK as u32,
+            &ops,
+            &mut out,
+            &mut blake3::Hasher::new(),
+        )
+        .unwrap();
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn apply_errors_on_a_corrupt_data_op() {
+        let mut out = Vec::new();
+        let ops = [Op::Data(b"not zstd at all".to_vec())];
+        assert!(apply(None, 0, BLOCK as u32, &ops, &mut out, &mut blake3::Hasher::new()).is_err());
     }
 }

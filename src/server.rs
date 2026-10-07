@@ -288,3 +288,63 @@ fn exec(out: &Out, dir: &Path, cmd: &[String]) -> Result<()> {
         },
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    /// Hands out 1, 2, 3, 1, 2, 3, … bytes per `read`, like a pipe under load.
+    struct Trickle {
+        data: Vec<u8>,
+        pos: usize,
+        step: usize,
+    }
+
+    impl Read for Trickle {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            self.step = self.step % 3 + 1;
+            let n = self.step.min(buf.len()).min(self.data.len() - self.pos);
+            buf[..n].copy_from_slice(&self.data[self.pos..self.pos + n]);
+            self.pos += n;
+            Ok(n)
+        }
+    }
+
+    #[test]
+    fn expand_home_only_expands_a_tilde_slash_prefix() {
+        let home = dirs::home_dir().unwrap();
+        assert_eq!(expand_home("~/x/y"), home.join("x/y"));
+        assert_eq!(expand_home("/abs/p"), PathBuf::from("/abs/p"));
+        assert_eq!(expand_home("rel/p"), PathBuf::from("rel/p"));
+        // current behaviour: a bare `~` or `~user/` is left alone
+        assert_eq!(expand_home("~"), PathBuf::from("~"));
+        assert_eq!(expand_home("~other/x"), PathBuf::from("~other/x"));
+    }
+
+    #[test]
+    fn read_full_fills_the_buffer_across_short_reads() {
+        let data: Vec<u8> = (0..100u8).collect();
+        let mut r = Trickle {
+            data: data.clone(),
+            pos: 0,
+            step: 0,
+        };
+        let mut buf = [0u8; 40];
+        assert_eq!(read_full(&mut r, &mut buf).unwrap(), 40);
+        assert_eq!(&buf[..], &data[..40]);
+        assert_eq!(read_full(&mut r, &mut buf).unwrap(), 40);
+        assert_eq!(&buf[..], &data[40..80]);
+        // EOF in the middle: a short count
+        assert_eq!(read_full(&mut r, &mut buf).unwrap(), 20);
+        assert_eq!(&buf[..20], &data[80..]);
+        assert_eq!(read_full(&mut r, &mut buf).unwrap(), 0);
+    }
+
+    #[test]
+    fn read_full_on_an_empty_reader_returns_zero() {
+        let mut buf = [0u8; 8];
+        assert_eq!(read_full(&mut Cursor::new(Vec::new()), &mut buf).unwrap(), 0);
+        assert_eq!(read_full(&mut Cursor::new(vec![1, 2]), &mut []).unwrap(), 0);
+    }
+}

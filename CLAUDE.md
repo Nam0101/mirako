@@ -10,14 +10,16 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ```
 cargo build --release          # binary at target/release/mirako (lto, strip)
-cargo test                     # unit tests only (patterns, delta, rewrite)
-cargo test delta::             # one module's tests
-cargo test insertion_in_the_middle_only_sends_the_change
-cargo clippy
+cargo test                     # unit tests (every module) + tests/e2e.rs (loopback, see below)
+cargo test --lib delta::       # one module's unit tests
+cargo test --test e2e          # end to end through the built binary, ~seconds, no ssh
+cargo bench                    # criterion: benches/{delta,proto,index,patterns,rewrite,gc,e2e}.rs
+cargo bench --bench delta -- --quick
+cargo clippy --all-targets
 cargo fmt                      # rustfmt.toml: max_width = 140
 ```
 
-There is no integration test harness; end-to-end behaviour is checked manually against a real ssh host (`mirako check`, then `mirako ./gradlew assembleDebug` in an Android project). `mirako gradle-shim print` shows the generated init script without installing it.
+`src/lib.rs` exists only so `tests/` and `benches/` can reach the modules; `main.rs` is the CLI on top of it. Unit tests live in each module (`#[cfg(test)]`). `tests/e2e.rs` runs the real protocol without ssh: the project's `mirako.toml` sets `ssh = ["sh", "-c", "exec <bin> serve"]` so client and agent talk over pipes, with `HOME` and `GRADLE_USER_HOME` pointed at a scratch dir so index caches, the global config and the Gradle init script never touch the real home. Tests that open an `Index` or call `gc::collect` outside that sandbox must delete the cache file they create (`Index::cache_path`) and set `GRADLE_USER_HOME`. Behaviour against a real host is still checked manually (`mirako check`, then `mirako ./gradlew assembleDebug` in an Android project). `mirako gradle-shim print` shows the generated init script without installing it.
 
 ## Architecture
 

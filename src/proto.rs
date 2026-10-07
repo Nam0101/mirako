@@ -232,3 +232,200 @@ pub fn read_frame<R: Read, T: DeserializeOwned>(r: &mut R) -> Result<T> {
     r.read_exact(&mut buf)?;
     Ok(bincode::deserialize(&buf)?)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    fn roundtrip<T: Serialize + DeserializeOwned>(msg: &T) -> T {
+        let mut buf = Vec::new();
+        write_frame(&mut buf, msg).unwrap();
+        let len = u32::from_be_bytes(buf[..4].try_into().unwrap()) as usize;
+        assert_eq!(len, buf.len() - 4, "length header counts the payload only");
+        let mut r = Cursor::new(buf);
+        let back = read_frame(&mut r).unwrap();
+        assert_eq!(r.position() as usize, len + 4, "read_frame consumes exactly one frame");
+        back
+    }
+
+    fn noise(len: usize, seed: u64) -> Vec<u8> {
+        let mut x = seed;
+        (0..len)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                x as u8
+            })
+            .collect()
+    }
+
+    #[test]
+    fn gc_request_survives_a_frame_roundtrip() {
+        let req = Req::Gc(GcReq {
+            folder: "~/mirako".into(),
+            keep_days: Some(14),
+            current: Some("app-1234".into()),
+            build: vec!["build".into(), "!build/keep".into()],
+            gradle_days: 7,
+            dry_run: true,
+            sizes: false,
+        });
+        let Req::Gc(g) = roundtrip(&req) else { panic!("wrong variant") };
+        assert_eq!(g.folder, "~/mirako");
+        assert_eq!(g.keep_days, Some(14));
+        assert_eq!(g.current.as_deref(), Some("app-1234"));
+        assert_eq!(g.build, vec!["build".to_string(), "!build/keep".to_string()]);
+        assert_eq!(g.gradle_days, 7);
+        assert!(g.dry_run);
+        assert!(!g.sizes);
+    }
+
+    #[test]
+    fn gc_report_with_mirrors_survives_a_frame_roundtrip() {
+        let resp = Resp::Gc(GcReport {
+            mirrors: vec![
+                Mirror {
+                    name: "a".into(),
+                    bytes: 1 << 40,
+                    idle_days: Some(30),
+                    removed: true,
+                },
+                Mirror {
+                    name: "b".into(),
+                    bytes: 0,
+                    idle_days: None,
+                    removed: false,
+                },
+            ],
+            build_bytes: 123,
+            free: u64::MAX,
+        });
+        let Resp::Gc(r) = roundtrip(&resp) else { panic!("wrong variant") };
+        assert_eq!(r.mirrors.len(), 2);
+        assert_eq!(
+            (
+                r.mirrors[0].name.as_str(),
+                r.mirrors[0].bytes,
+                r.mirrors[0].idle_days,
+                r.mirrors[0].removed
+            ),
+            ("a", 1 << 40, Some(30), true)
+        );
+        assert_eq!(
+            (
+                r.mirrors[1].name.as_str(),
+                r.mirrors[1].bytes,
+                r.mirrors[1].idle_days,
+                r.mirrors[1].removed
+            ),
+            ("b", 0, None, false)
+        );
+        assert_eq!(r.build_bytes, 123);
+        assert_eq!(r.free, u64::MAX);
+    }
+
+    #[test]
+    fn fetch_with_a_signature_survives_a_frame_roundtrip() {
+        let sig = Signature {
+            block: 65536,
+            size: 65536 + 7,
+            blocks: vec![(0xdead_beef, [1; 16]), (42, [2; 16])],
+        };
+        let req = Req::Fetch {
+            dir: "/r/app".into(),
+            paths: vec!["app/build/x.apk".into()],
+            sigs: vec![("app/build/x.apk".into(), sig)],
+        };
+        let Req::Fetch { dir, paths, sigs } = roundtrip(&req) else {
+            panic!("wrong variant")
+        };
+        assert_eq!(dir, "/r/app");
+        assert_eq!(paths, vec!["app/build/x.apk".to_string()]);
+        assert_eq!(sigs.len(), 1);
+        assert_eq!(sigs[0].0, "app/build/x.apk");
+        assert_eq!((sigs[0].1.block, sigs[0].1.size), (65536, 65543));
+        assert_eq!(sigs[0].1.blocks, vec![(0xdead_beef, [1; 16]), (42, [2; 16])]);
+    }
+
+    #[test]
+    fn output_bytes_survive_a_frame_roundtrip_byte_exact() {
+        let data = vec![0u8, 0xff, b'\n', 0x80, b'x'];
+        let Resp::Output { stderr, data: back } = roundtrip(&Resp::Output {
+            stderr: true,
+            data: data.clone(),
+        }) else {
+            panic!("wrong variant")
+        };
+        assert!(stderr);
+        assert_eq!(back, data);
+    }
+
+    #[test]
+    fn consecutive_frames_are_read_back_in_order() {
+        let mut buf = Vec::new();
+        write_frame(&mut buf, &Req::Flush).unwrap();
+        write_frame(&mut buf, &Req::Bye).unwrap();
+        let mut r = Cursor::new(buf);
+        assert!(matches!(read_frame::<_, Req>(&mut r).unwrap(), Req::Flush));
+        assert!(matches!(read_frame::<_, Req>(&mut r).unwrap(), Req::Bye));
+        assert!(read_frame::<_, Req>(&mut r).is_err());
+    }
+
+    #[test]
+    fn read_frame_rejects_a_length_above_the_limit() {
+        let mut buf = (MAX_FRAME + 1).to_be_bytes().to_vec();
+        buf.extend_from_slice(&[0; 16]);
+        let err = read_frame::<_, Req>(&mut Cursor::new(buf)).unwrap_err();
+        assert!(format!("{err:#}").contains("exceeds the limit"), "{err:#}");
+    }
+
+    #[test]
+    fn read_frame_on_an_empty_reader_says_connection_closed() {
+        let err = read_frame::<_, Req>(&mut Cursor::new(Vec::new())).unwrap_err();
+        assert!(format!("{err:#}").contains("connection closed"), "{err:#}");
+    }
+
+    #[test]
+    fn read_frame_errors_on_a_truncated_header_or_body() {
+        assert!(read_frame::<_, Req>(&mut Cursor::new(vec![0, 0])).is_err());
+        let mut buf = Vec::new();
+        write_frame(&mut buf, &Req::Hello { version: "1.2.3".into() }).unwrap();
+        buf.truncate(buf.len() - 2);
+        assert!(read_frame::<_, Req>(&mut Cursor::new(buf)).is_err());
+    }
+
+    #[test]
+    fn compress_roundtrips_empty_tiny_compressible_and_random_data() {
+        for data in [Vec::new(), vec![7u8], b"abcdefgh".repeat(128 * 1024), noise(300_000, 9)] {
+            let z = compress(&data).unwrap();
+            assert_eq!(decompress(&z).unwrap(), data, "len {}", data.len());
+        }
+        assert!(compress(&b"abcdefgh".repeat(128 * 1024)).unwrap().len() < 64 * 1024);
+    }
+
+    #[test]
+    fn decompress_of_garbage_errors() {
+        assert!(decompress(b"definitely not a zstd frame").is_err());
+        assert!(decompress(&[]).is_err());
+    }
+
+    #[test]
+    fn streaming_frames_without_a_content_size_still_decompress() {
+        let data = b"hello mirako ".repeat(1000);
+        let z = zstd::stream::encode_all(&data[..], ZSTD_LEVEL).unwrap();
+        assert_eq!(decompress(&z).unwrap(), data);
+    }
+
+    #[test]
+    fn decompress_accepts_up_to_two_chunks_and_rejects_more() {
+        let one = vec![0u8; CHUNK];
+        assert_eq!(decompress(&compress(&one).unwrap()).unwrap().len(), CHUNK);
+        let two = vec![0u8; 2 * CHUNK];
+        assert_eq!(decompress(&compress(&two).unwrap()).unwrap().len(), 2 * CHUNK);
+        let bomb = compress(&vec![0u8; 2 * CHUNK + 1]).unwrap();
+        let err = decompress(&bomb).unwrap_err();
+        assert!(format!("{err:#}").contains("exceeds the chunk limit"), "{err:#}");
+    }
+}

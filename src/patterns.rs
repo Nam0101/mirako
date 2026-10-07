@@ -125,4 +125,92 @@ mod tests {
         assert!(!m.skip_subtree("build"));
         assert!(!m.excluded("app/build/x")); // the anchored exclude never applied here
     }
+
+    fn m(patterns: &[&str]) -> Matcher {
+        Matcher::new(&patterns.iter().map(|p| p.to_string()).collect::<Vec<_>>()).unwrap()
+    }
+
+    #[test]
+    fn trailing_slash_whitespace_and_empty_patterns_are_tolerated() {
+        let a = m(&["build/ ", "", "  ", " /local.properties", " ! keep/ "]);
+        for p in ["build", "app/build", "app/build/x", "local.properties"] {
+            assert!(a.excluded(p), "{p}");
+        }
+        assert!(!a.excluded("app/local.properties"));
+        assert!(!a.excluded("build/keep"));
+        let empty = m(&["", "  ", "/", "!"]);
+        assert!(!empty.excluded("anything"));
+        assert!(!empty.excluded("a/b"));
+    }
+
+    #[test]
+    fn star_never_crosses_a_slash() {
+        let a = m(&["*.apk", "app/*.aab"]);
+        assert!(a.excluded("x.apk"));
+        assert!(a.excluded("a/b/x.apk"));
+        assert!(a.excluded("app/x.aab"));
+        assert!(a.excluded("mod/app/x.aab"));
+        assert!(!a.excluded("app/x/y.aab"));
+        assert!(!a.excluded("x.apk.txt"));
+    }
+
+    #[test]
+    fn explicit_double_star_and_question_mark_globs_work() {
+        let a = m(&["**/generated", "?.tmp", "/src/**/*.bak"]);
+        assert!(a.excluded("generated"));
+        assert!(a.excluded("app/build/generated/R.java"));
+        assert!(a.excluded("a.tmp"));
+        assert!(a.excluded("dir/b.tmp"));
+        assert!(!a.excluded("ab.tmp"));
+        assert!(!a.excluded(".tmp"));
+        assert!(a.excluded("src/x.bak"));
+        assert!(a.excluded("src/a/b/x.bak"));
+        assert!(!a.excluded("app/src/x.bak"));
+    }
+
+    #[test]
+    fn a_bad_glob_is_an_error_naming_the_pattern() {
+        let err = Matcher::new(&["build".into(), "[abc".into()]).err().expect("must fail");
+        assert!(format!("{err:#}").contains("bad pattern `[abc`"), "{err:#}");
+        let err = Matcher::new(&["!keep/[x".into()]).err().expect("must fail");
+        assert!(format!("{err:#}").contains("keep/[x"), "{err:#}");
+    }
+
+    #[test]
+    fn an_include_without_a_matching_exclude_excludes_nothing() {
+        let a = m(&["!keep"]);
+        for p in ["keep", "keep/x", "other", "a/keep"] {
+            assert!(!a.excluded(p), "{p}");
+            assert!(!a.skip_subtree(p), "{p}");
+        }
+    }
+
+    #[test]
+    fn an_excluded_directory_is_skipped_unless_an_include_lies_below_it() {
+        let plain = m(&["build"]);
+        assert!(plain.excluded("build"));
+        assert!(plain.skip_subtree("build"));
+
+        let deep = m(&["build", "!build/a/b/keep"]);
+        assert!(deep.excluded("build"));
+        for p in ["build", "build/a", "build/a/b", "app/build", "app/build/a/b"] {
+            assert!(!deep.skip_subtree(p), "ancestor {p}");
+        }
+        for p in ["build/c", "build/a/c", "build/a/b/other", "app/build/c"] {
+            assert!(deep.skip_subtree(p), "sibling {p}");
+        }
+        assert!(!deep.excluded("build/a/b/keep"));
+        assert!(!deep.excluded("app/build/a/b/keep/x.txt"));
+        assert!(deep.excluded("build/a/b/other"));
+        // an ancestor is still excluded itself: only its subtree walk is kept
+        assert!(deep.excluded("build/a"));
+    }
+
+    #[test]
+    fn matcher_is_clone() {
+        fn assert_clone<T: Clone>(_: &T) {}
+        let a = m(&["build"]);
+        assert_clone(&a);
+        assert!(a.clone().excluded("build"));
+    }
 }

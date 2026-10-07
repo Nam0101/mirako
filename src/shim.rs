@@ -93,3 +93,43 @@ pub fn install() -> Result<PathBuf> {
     fs::write(&path, init_script(&bin.to_string_lossy()))?;
     Ok(path)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn init_script_substitutes_the_binary_path() {
+        let s = init_script("/x/bin/mirako");
+        assert!(s.contains(r#"System.getenv("MIRAKO_BIN") ?: "/x/bin/mirako""#));
+        assert!(!s.contains("__BIN__"));
+        assert_eq!(INIT_SCRIPT.matches("__BIN__").count(), 1);
+    }
+
+    #[test]
+    fn init_script_keeps_every_bail_out() {
+        for marker in [
+            "\"updateDaemonJvm\"",
+            "\":updateDaemonJvm\"",
+            "\"wrapper\"",
+            "\":wrapper\"",
+            "System.getenv(\"MIRAKO_REMOTE\") == \"1\"",
+            "System.getenv(\"MIRAKO_LOCAL\") == \"1\"",
+            "containsKey(\"mirako.disabled\")",
+            "excludedTaskNames.remove(\"mirako\")",
+            "contains(\"mirako.enabled=false\")",
+            "[bin, \"check\", \"--project\", root.path]",
+            "check.exitValue() != 0",
+            "sp.dryRun",
+        ] {
+            assert!(INIT_SCRIPT.contains(marker), "missing {marker}");
+        }
+    }
+
+    #[test]
+    fn init_script_registers_one_mirako_exec_task_running_gradlew() {
+        assert!(INIT_SCRIPT.contains("p.tasks.register(\"mirako\", Exec)"));
+        assert!(INIT_SCRIPT.contains("sp.setTaskNames([\"mirako\"])"));
+        assert!(INIT_SCRIPT.contains("[bin, \"run\", \"--project\", projectRoot.path, \"--\", \"./gradlew\"]"));
+    }
+}
