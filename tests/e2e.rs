@@ -594,3 +594,42 @@ fn the_installed_init_script_follows_this_binary_and_shim_check() {
     assert!(!stderr(&o).contains("updated"), "{}", show(&o));
     assert_eq!(fs::read_to_string(&script).unwrap(), other);
 }
+
+#[test]
+fn setup_checks_ssh_reports_the_host_and_installs_shim_and_agent() {
+    let s = Scratch::new();
+    let fake = fake_ssh(&s);
+    let agent = s.path.join("agent/mirako");
+    let global = s.home().join(".config/mirako/config.toml");
+    fs::create_dir_all(global.parent().unwrap()).unwrap();
+    fs::write(
+        &global,
+        format!(
+            "host = \"loop\"\nssh = [\"sh\", {:?}]\nremote_bin = {:?}\nfallback = false\n",
+            fake.to_str().unwrap(),
+            agent.to_str().unwrap()
+        ),
+    )
+    .unwrap();
+    let o = s.mirako(&["setup"]);
+    assert_eq!(o.status.code(), Some(0), "{}", show(&o));
+    let out = stdout(&o);
+    for want in ["config.toml exists", "ssh loop: ok", "\nloop: ", "init.d/mirako.gradle", " ok ("] {
+        assert!(out.contains(want), "missing {want:?} in {}", show(&o));
+    }
+    assert!(stderr(&o).contains("installing mirako"), "{}", show(&o));
+    assert_eq!(fs::read(&agent).unwrap(), fs::read(BIN).unwrap());
+    assert!(fs::read_to_string(s.home().join(".gradle/init.d/mirako.gradle"))
+        .unwrap()
+        .contains(BIN));
+
+    // a refusal from something that is not ssh is reported, not repaired
+    fs::write(
+        &global,
+        "host = \"loop\"\nssh = [\"sh\", \"-c\", \"echo 'Permission denied (publickey).' >&2; exit 255\"]\n",
+    )
+    .unwrap();
+    let o = s.mirako(&["setup"]);
+    assert_eq!(o.status.code(), Some(2), "{}", show(&o));
+    assert!(stderr(&o).contains("ssh loop failed: Permission denied"), "{}", show(&o));
+}

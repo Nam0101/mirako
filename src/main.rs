@@ -1,8 +1,7 @@
-use anyhow::{bail, Result};
+use anyhow::Result;
 use clap::{Parser, Subcommand};
 use mirako::config::{self, Config};
-use mirako::{client, server, shim};
-use std::fs;
+use mirako::{client, server, setup, shim};
 use std::path::PathBuf;
 
 /// Remote builds: sync the project to another machine over ssh, run the command there, pull the outputs back.
@@ -62,7 +61,7 @@ enum Cmd {
         #[arg(long)]
         host: Option<String>,
     },
-    /// first run: write the global config, install the Gradle init script, put the agent on the host, handshake
+    /// first run: global config, password-less ssh, what the host has, Gradle init script, agent on the host
     Setup {
         /// ssh host or alias; required the first time (written into the global config)
         #[arg(long)]
@@ -124,28 +123,6 @@ fn load(project: Option<&PathBuf>, host: Option<&str>) -> Result<(PathBuf, Confi
     let root = client::project_root_for(project)?;
     let cfg = Config::load(&root, host)?;
     Ok((root, cfg))
-}
-
-/// `mirako setup [--host H]`: everything a new machine needs, each step idempotent.
-fn setup(host: Option<&str>) -> Result<i32> {
-    let global = config::global_config_path();
-    if global.exists() {
-        println!("{} exists", global.display());
-    } else {
-        let Some(host) = host else {
-            bail!("no {} yet: pass --host <ssh host or alias> the first time", global.display());
-        };
-        fs::create_dir_all(global.parent().unwrap())?;
-        fs::write(&global, config::sample_global(host))?;
-        println!("wrote {} (host = {host})", global.display());
-    }
-    println!("wrote {}", shim::install()?.display());
-    // works outside a project too: the global config names the host
-    let root = client::project_root_for(None).unwrap_or_else(|_| PathBuf::from("."));
-    let cfg = Config::load(&root, host)?;
-    // the handshake installs or updates the agent on the host when needed
-    client::check(&cfg)?;
-    Ok(0)
 }
 
 fn real_main() -> Result<i32> {
@@ -229,7 +206,10 @@ fn real_main() -> Result<i32> {
             client::remote_install(&cfg)?;
             Ok(0)
         }
-        Some(Cmd::Setup { host }) => setup(host.as_deref()),
+        Some(Cmd::Setup { host }) => {
+            setup::setup(host.as_deref())?;
+            Ok(0)
+        }
         Some(Cmd::Init { project, global }) => {
             if global {
                 let p = config::global_config_path();

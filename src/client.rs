@@ -23,6 +23,15 @@ use std::time::Instant;
 /// Gradle shim falls back to a local build instead of hanging on the TCP timeout.
 const SSH_OPTS: &[&str] = &["-o", "BatchMode=yes", "-o", "ConnectTimeout=8"];
 
+pub const REPO: &str = "https://github.com/Nam0101/mirako";
+
+/// `ssh <opts> host`, ready for the remote command as the next argument.
+pub fn ssh(cfg: &Config) -> Command {
+    let mut cmd = Command::new(&cfg.ssh[0]);
+    cmd.args(&cfg.ssh[1..]).args(SSH_OPTS).arg(&cfg.host);
+    cmd
+}
+
 pub struct Session {
     child: Child,
     reader: BufReader<std::process::ChildStdout>,
@@ -70,12 +79,8 @@ impl Session {
     }
 
     fn attempt(cfg: &Config, first: Option<&Req>) -> Result<Attempt> {
-        let mut cmd = Command::new(&cfg.ssh[0]);
-        cmd.args(&cfg.ssh[1..])
-            .args(SSH_OPTS)
-            .arg(&cfg.host)
-            .arg(format!("{} serve", cfg.remote_bin));
-        let mut child = cmd
+        let mut child = ssh(cfg)
+            .arg(format!("{} serve", cfg.remote_bin))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
@@ -473,7 +478,7 @@ pub struct RunOptions {
     pub quiet: bool,
 }
 
-fn human(bytes: u64) -> String {
+pub fn human(bytes: u64) -> String {
     if bytes >= 1 << 30 {
         format!("{:.1} GB", bytes as f64 / (1u64 << 30) as f64)
     } else if bytes >= 1 << 20 {
@@ -716,40 +721,31 @@ pub fn check(cfg: &Config) -> Result<()> {
     Ok(())
 }
 
-/// Copy this binary to `remote_bin` on the host when OS/arch match.
+/// Put this version at `remote_bin` on the host: a copy of this binary when OS/arch match,
+/// otherwise a build there with the host's own cargo.
 pub fn remote_install(cfg: &Config) -> Result<()> {
-    let uname = |host: Option<&str>| -> Result<String> {
-        let out = match host {
-            Some(h) => Command::new(&cfg.ssh[0])
-                .args(&cfg.ssh[1..])
-                .args(SSH_OPTS)
-                .arg(h)
-                .arg("uname -sm")
-                .output()?,
-            None => Command::new("uname").arg("-sm").output()?,
+    let uname = |host: bool| -> Result<String> {
+        let out = if host {
+            ssh(cfg).arg("uname -sm").stdin(Stdio::null()).output()?
+        } else {
+            Command::new("uname").arg("-sm").output()?
         };
         Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
     };
-    let local = uname(None)?;
-    let remote = uname(Some(&cfg.host))?;
+    let local = uname(false)?;
+    let remote = uname(true)?;
     if remote.is_empty() {
         bail!("cannot ssh to {}", cfg.host);
     }
     if local != remote {
-        bail!("{} is `{remote}` but this binary is for `{local}`. Build mirako there instead: `cargo install --git https://github.com/Nam0101/mirako`", cfg.host);
+        return build_on_host(cfg, &remote);
     }
     let me = std::env::current_exe()?;
     let bytes = fs::read(&me)?;
     let dest = cfg.remote_bin.clone();
     let script =
         format!("mkdir -p \"$(dirname {dest})\" && cat > {dest}.tmp && chmod +x {dest}.tmp && mv {dest}.tmp {dest} && {dest} --version");
-    let mut child = Command::new(&cfg.ssh[0])
-        .args(&cfg.ssh[1..])
-        .args(SSH_OPTS)
-        .arg(&cfg.host)
-        .arg(script)
-        .stdin(Stdio::piped())
-        .spawn()?;
+    let mut child = ssh(cfg).arg(script).stdin(Stdio::piped()).spawn()?;
     child.stdin.take().unwrap().write_all(&bytes)?;
     let status = child.wait()?;
     if !status.success() {
@@ -757,6 +753,42 @@ pub fn remote_install(cfg: &Config) -> Result<()> {
     }
     println!("installed {} ({}) on {}", dest, human(bytes.len() as u64), cfg.host);
     Ok(())
+}
+
+/// The host runs another OS or architecture: `cargo install` the release tag of this version
+/// there (needs Rust on the host) and move the binary to `remote_bin`.
+fn build_on_host(cfg: &Config, remote_os: &str) -> Result<()> {
+    eprintln!(
+        "mirako: {} is `{remote_os}`, this binary is not: building mirako {} there with cargo (a few minutes)",
+        cfg.host,
+        proto::VERSION
+    );
+    let status = ssh(cfg)
+        .arg(build_script(proto::VERSION, &cfg.remote_bin))
+        .stdin(Stdio::null())
+        .status()?;
+    let manual = format!("`cargo install --git {REPO} --tag v{}`", proto::VERSION);
+    match status.code() {
+        Some(0) => {
+            println!("built {} on {}", cfg.remote_bin, cfg.host);
+            Ok(())
+        }
+        Some(3) => bail!(
+            "no cargo on {}: install Rust there (https://rustup.rs) and run `mirako setup` again, or build mirako there yourself with {manual}",
+            cfg.host
+        ),
+        _ => bail!("building mirako on {} failed (output above); {manual} there should say why", cfg.host),
+    }
+}
+
+/// Remote sh: cargo from PATH or `~/.cargo/bin` (exit 3 when neither) installs the tag into a
+/// scratch root, then the binary moves to `remote_bin`.
+fn build_script(version: &str, remote_bin: &str) -> String {
+    format!(
+        "C=$(command -v cargo || echo \"$HOME/.cargo/bin/cargo\"); [ -x \"$C\" ] || exit 3; \
+         \"$C\" install --git {REPO} --tag v{version} --force --root \"$HOME/.mirako-build\" && \
+         mkdir -p \"$(dirname {remote_bin})\" && mv \"$HOME/.mirako-build/bin/mirako\" {remote_bin} && {remote_bin} --version"
+    )
 }
 
 pub fn project_root_for(path: Option<&PathBuf>) -> Result<PathBuf> {
@@ -770,6 +802,17 @@ pub fn project_root_for(path: Option<&PathBuf>) -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_build_script_installs_this_versions_tag_and_exits_3_without_cargo() {
+        let s = build_script("0.4.0", "~/.local/bin/mirako");
+        assert!(s.contains(&format!("install --git {REPO} --tag v0.4.0")), "{s}");
+        assert!(s.contains("|| exit 3;"), "{s}");
+        assert!(
+            s.ends_with("mv \"$HOME/.mirako-build/bin/mirako\" ~/.local/bin/mirako && ~/.local/bin/mirako --version"),
+            "{s}"
+        );
+    }
 
     #[test]
     fn human_picks_the_unit_at_each_boundary() {

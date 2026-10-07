@@ -10,5 +10,6 @@ pub mod patterns;
 pub mod proto;
 pub mod rewrite;
 pub mod server;
+pub mod setup;
 pub mod shim;
 pub mod xfer;

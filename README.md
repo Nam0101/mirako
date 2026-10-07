@@ -36,13 +36,17 @@ cargo install --git https://github.com/Nam0101/mirako
 mirako setup --host m4                   # global config, Gradle init script, agent on the host, handshake
 ```
 
-`setup` copies this binary to `~/.local/bin/mirako` on the host (`remote_bin`), which works when
-both machines share the OS and architecture (e.g. two Apple-silicon Macs); otherwise run the
-`cargo install` there too. From then on the client keeps both in step: a handshake that finds
-no agent, or one of another version, installs this binary there and retries, and `mirako run`
-rewrites the Gradle init script when it is out of date, so after a `cargo install` nothing else
-is needed. The pieces on their own: `mirako init --global`, `mirako gradle-shim install`,
-`mirako remote-install --host m4`.
+`setup` first makes sure `ssh m4` works without a password (if not, it generates a key when
+there is none and runs `ssh-copy-id`, which asks for the host's password once), reports what
+the agent's non-interactive shell on the host sees (java, `ANDROID_HOME`, free disk) with a
+warning for each missing piece, writes the Gradle init script, and handshakes, which puts this
+binary on the host as `~/.local/bin/mirako` (`remote_bin`). A host with another OS or
+architecture gets the agent built there instead, by its own cargo from this version's release
+tag (`cargo install --git … --tag v<version>`, a few minutes), so Rust must be installed on it.
+From then on the client keeps both in step: a handshake that finds no agent, or one of another
+version, installs it the same way and retries, and `mirako run` rewrites the Gradle init script
+when it is out of date, so after a `cargo install` nothing else is needed. The pieces on their
+own: `mirako init --global`, `mirako gradle-shim install`, `mirako remote-install --host m4`.
 
 The remote needs whatever the command needs (JDK, Android SDK, …) reachable from a
 non-interactive ssh shell. On macOS put `JAVA_HOME`/`ANDROID_HOME`/`PATH` in `~/.zshenv`.
