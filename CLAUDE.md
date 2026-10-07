@@ -19,6 +19,8 @@ cargo clippy --all-targets
 cargo fmt                      # rustfmt.toml: max_width = 140
 ```
 
+CI is `.github/workflows/ci.yml` on a self-hosted GitHub Actions runner on the m4 (`~/actions-runner`, LaunchAgent service, labels `self-hosted, macOS, ARM64, m4`): fmt + `clippy -D warnings` + `cargo test` on every PR and push to `main`, `cargo bench` on pushes to `main` (artifact), and on a `v*` tag matching `Cargo.toml` a release build published with `gh release create`. The runner's user needs rustup in `~/.cargo`.
+
 `src/lib.rs` exists only so `tests/` and `benches/` can reach the modules; `main.rs` is the CLI on top of it. Unit tests live in each module (`#[cfg(test)]`). `tests/e2e.rs` runs the real protocol without ssh: the project's `mirako.toml` sets `ssh = ["sh", "-c", "exec <bin> serve"]` so client and agent talk over pipes, with `HOME` and `GRADLE_USER_HOME` pointed at a scratch dir so index caches, the global config and the Gradle init script never touch the real home. Tests that open an `Index` or call `gc::collect` outside that sandbox must delete the cache file they create (`Index::cache_path`) and set `GRADLE_USER_HOME`. Behaviour against a real host is still checked manually (`mirako check`, then `mirako ./gradlew assembleDebug` in an Android project). `mirako gradle-shim print` shows the generated init script without installing it.
 
 ## Architecture

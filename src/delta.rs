@@ -79,7 +79,7 @@ pub fn delta(new: &[u8], sig: &Signature, mut emit: impl FnMut(Op) -> Result<()>
     let mut filter = vec![0u64; 1 << (FILTER_BITS - 6)];
     for (i, (w, _)) in sig.blocks.iter().enumerate() {
         // the last block may be partial; a full window can never equal it
-        if i + 1 == sig.blocks.len() && sig.size as usize % b != 0 {
+        if i + 1 == sig.blocks.len() && !(sig.size as usize).is_multiple_of(b) {
             break;
         }
         lookup.entry(*w).or_default().push(i as u32);
