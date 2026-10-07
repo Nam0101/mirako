@@ -2,18 +2,19 @@
 
 use crate::config::Config;
 use crate::delta;
-use crate::index::Index;
+use crate::index::{Index, Sigs};
 use crate::patterns::Matcher;
 use crate::proto::{self, read_frame, write_frame, Chunk, DeltaChunk, Entry, GcReport, GcReq, Kind, Req, Resp, CHUNK};
 use crate::rewrite::LineRewriter;
 use crate::server::read_full;
 use crate::xfer::Inbox;
 use anyhow::{anyhow, bail, Context, Result};
+use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{self, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, ChildStdout, Command, Stdio};
 use std::thread;
 use std::time::Instant;
 
@@ -39,7 +40,9 @@ pub struct Stats {
 }
 
 impl Session {
-    pub fn connect(cfg: &Config) -> Result<Self> {
+    /// Starts `mirako serve` over ssh and shakes hands. `first` goes out in the same write as
+    /// the `Hello`, so the agent is already working on it while the reply crosses the link.
+    pub fn connect(cfg: &Config, first: Option<&Req>) -> Result<Self> {
         let mut cmd = Command::new(&cfg.ssh[0]);
         cmd.args(&cfg.ssh[1..])
             .args(SSH_OPTS)
@@ -53,14 +56,20 @@ impl Session {
             .context("starting ssh")?;
         let mut reader = BufReader::new(child.stdout.take().unwrap());
         let mut writer = BufWriter::new(child.stdin.take().unwrap());
-        write_frame(
-            &mut writer,
-            &Req::Hello {
-                version: proto::VERSION.into(),
-            },
-        )?;
-        writer.flush()?;
-        let hello: Resp = read_frame(&mut reader).map_err(|e| {
+        let handshake = (|| -> Result<Resp> {
+            write_frame(
+                &mut writer,
+                &Req::Hello {
+                    version: proto::VERSION.into(),
+                },
+            )?;
+            if let Some(req) = first {
+                write_frame(&mut writer, req)?;
+            }
+            writer.flush()?;
+            read_frame(&mut reader)
+        })();
+        let hello = handshake.map_err(|e| {
             let _ = child.wait();
             anyhow!(
                 "no answer from `{} serve` on {} ({e}). Is the host reachable and mirako installed there? Try `mirako remote-install`.",
@@ -100,30 +109,12 @@ impl Session {
     }
 
     fn recv(&mut self) -> Result<Resp> {
-        match read_frame(&mut self.reader)? {
-            Resp::Error { msg } => bail!("remote: {msg}"),
-            r => Ok(r),
-        }
+        recv(&mut self.reader)
     }
 
-    /// Asks the remote for its manifest and runs `local` (the local scan) while it is scanning,
-    /// so the two scans overlap instead of adding up.
-    fn manifests<T>(&mut self, dir: &str, exclude: &[String], local: impl FnOnce() -> Result<T>) -> Result<(T, Vec<Entry>)> {
-        self.send(&Req::Manifest {
-            dir: dir.into(),
-            exclude: exclude.to_vec(),
-        })?;
-        self.writer.flush()?;
-        let mine = local()?;
-        match self.recv()? {
-            Resp::Manifest { entries, .. } => Ok((mine, entries)),
-            other => bail!("unexpected reply {other:?}"),
-        }
-    }
-
-    /// `Flush`, then the requests of the phases after the push, in one write: the agent answers
-    /// the `Ack` and goes straight on to them, so the push, the command and the pull manifest
-    /// cost one round trip between them instead of one each. Returns the failed delta pushes.
+    /// `Flush`, then the requests of the phase after the push (the `Exec`), in one write: the
+    /// agent answers the `Ack` and goes straight on to them, so the push and the command cost one
+    /// round trip between them instead of one each. Returns the failed delta pushes.
     fn flush_and(&mut self, after: &[Req]) -> Result<Vec<String>> {
         self.send(&Req::Flush)?;
         for r in after {
@@ -141,11 +132,15 @@ impl Session {
         read_frame::<_, Resp>(&mut self.reader).map(drop)
     }
 
-    /// Upload: make the remote copy of the upload scope identical to the local one. `after` is
-    /// queued behind the final `Flush` (see `flush_and`).
+    /// Upload: make the remote copy of the upload scope identical to the local one. The scope's
+    /// `Manifest` request went out with the handshake (`connect`), so the agent scans its copy
+    /// while the local scan runs here. `after` is queued behind the final `Flush` (see `flush_and`).
     pub fn push(&mut self, root: &Path, index: &mut Index, remote_dir: &str, exclude: &[String], after: &[Req]) -> Result<Stats> {
-        let matcher = Matcher::new(exclude)?;
-        let (local, remote) = self.manifests(remote_dir, exclude, || index.scan(root, &matcher))?;
+        let local = index.scan(root, &Matcher::new(exclude)?)?;
+        let remote = match self.recv()? {
+            Resp::Manifest { entries, .. } => entries,
+            other => bail!("unexpected reply {other:?}"),
+        };
         let remote_map: HashMap<&str, &Entry> = remote.iter().map(|e| (e.path.as_str(), e)).collect();
         let local_set: HashSet<&str> = local.iter().map(|e| e.path.as_str()).collect();
 
@@ -258,6 +253,7 @@ impl Session {
         Ok(wire)
     }
 
+    /// `e.hash` comes from the scan that found the file changed, so the file is read once here.
     fn send_delta(&mut self, root: &Path, e: &Entry, sig: &proto::Signature) -> Result<u64> {
         let data = fs::read(root.join(&e.path))?;
         let head = DeltaChunk {
@@ -265,7 +261,7 @@ impl Session {
             mode: e.mode,
             mtime_ns: e.mtime_ns,
             size: e.size,
-            hash: *blake3::hash(&data).as_bytes(),
+            hash: e.hash,
             ops: Vec::new(),
             last: false,
         };
@@ -273,99 +269,37 @@ impl Session {
         delta::stream(&data, sig, &head, |frame| write_frame(writer, &Req::Delta(frame)))
     }
 
-    /// Streams the output of the `Exec` queued earlier, remote paths rewritten to local ones.
-    /// Returns the exit code.
-    pub fn exec_output(&mut self, remote_dir: &str, local_root: &Path) -> Result<i32> {
-        // the remote project path (`~` expanded with the agent's home) for output rewriting
-        let remote_abs = match remote_dir.strip_prefix("~/") {
-            Some(r) => format!("{}/{r}", self.remote_home),
-            None => remote_dir.to_string(),
-        };
-        let local = local_root.to_string_lossy().into_owned();
-        let mut out_rw = LineRewriter::new(&remote_abs, &local);
-        let mut err_rw = LineRewriter::new(&remote_abs, &local);
-        let stdout = io::stdout();
-        let stderr = io::stderr();
-        loop {
-            match self.recv()? {
-                Resp::Output { stderr: is_err, data } => {
-                    if is_err {
-                        let mut h = stderr.lock();
-                        h.write_all(&err_rw.feed(&data))?;
-                        h.flush()?;
-                    } else {
-                        let mut h = stdout.lock();
-                        h.write_all(&out_rw.feed(&data))?;
-                        h.flush()?;
-                    }
-                }
-                Resp::Exit { code } => {
-                    stdout.lock().write_all(&out_rw.flush())?;
-                    stderr.lock().write_all(&err_rw.flush())?;
-                    return Ok(code);
-                }
-                other => bail!("unexpected reply {other:?}"),
-            }
-        }
-    }
-
-    /// Download: bring every remote file of the download scope that differs from the local copy.
-    /// Never deletes anything locally. Big files the local side already has come as deltas.
-    /// The pull `Manifest` was queued earlier and `local` scanned while the command ran.
-    pub fn pull(&mut self, root: &Path, index: &mut Index, remote_dir: &str, local: Vec<Entry>) -> Result<Stats> {
-        let local_map: HashMap<&str, &Entry> = local.iter().map(|e| (e.path.as_str(), e)).collect();
-        let remote = match self.recv()? {
-            Resp::Manifest { entries, .. } => entries,
-            other => bail!("unexpected reply {other:?}"),
-        };
-        let wanted: Vec<&Entry> = remote
-            .iter()
-            .filter(|e| match local_map.get(e.path.as_str()) {
-                Some(l) => l.hash != e.hash || l.kind != e.kind,
-                None => true,
-            })
-            .collect();
+    /// Download: the `Pull` request went up while the command ran (see `run`), so the agent is
+    /// already streaming every file of the download scope that differs from the local copy; this
+    /// receives them. Never deletes anything locally. `gc_queued`: a `Gc` was sent right behind
+    /// the `Pull`, so its report follows the stream and is returned here.
+    pub fn pull(&mut self, root: &Path, index: &mut Index, remote_dir: &str, gc_queued: bool) -> Result<(Stats, Option<Result<GcReport>>)> {
         let mut stats = Stats::default();
-        if wanted.is_empty() {
-            return Ok(stats);
-        }
-        let mut sigs = Vec::new();
-        for e in &wanted {
-            if e.kind == Kind::File && delta::delta_worthwhile(e.size) {
-                if let Some(l) = local_map.get(e.path.as_str()) {
-                    if l.kind == Kind::File {
-                        sigs.push((e.path.clone(), delta::signature(&root.join(&e.path))?));
-                    }
-                }
-            }
-        }
-        let paths: Vec<String> = wanted.iter().map(|e| e.path.clone()).collect();
-        let mut retry = self.fetch(root, index, remote_dir, paths, sigs, &mut stats)?;
-        if !retry.is_empty() {
+        let failed = self.receive(root, index, &mut stats)?;
+        // read before the retry below, which the agent only sees after the `Gc`
+        let gc = gc_queued.then(|| match read_frame(&mut self.reader)? {
+            Resp::Gc(r) => Ok(r),
+            Resp::Error { msg } => bail!("remote: {msg}"),
+            other => bail!("unexpected reply {other:?}"),
+        });
+        if !failed.is_empty() {
             // deltas that rebuilt to the wrong hash: fetch those whole
-            retry = self.fetch(root, index, remote_dir, retry, Vec::new(), &mut stats)?;
-            if !retry.is_empty() {
-                bail!("could not download {}", retry.join(", "));
+            self.send(&Req::Fetch {
+                dir: remote_dir.into(),
+                paths: failed,
+            })?;
+            self.writer.flush()?;
+            let again = self.receive(root, index, &mut stats)?;
+            if !again.is_empty() {
+                bail!("could not download {}", again.join(", "));
             }
         }
-        Ok(stats)
+        Ok((stats, gc))
     }
 
-    fn fetch(
-        &mut self,
-        root: &Path,
-        index: &mut Index,
-        remote_dir: &str,
-        paths: Vec<String>,
-        sigs: Vec<(String, proto::Signature)>,
-        stats: &mut Stats,
-    ) -> Result<Vec<String>> {
-        self.send(&Req::Fetch {
-            dir: remote_dir.into(),
-            paths,
-            sigs,
-        })?;
-        self.writer.flush()?;
+    /// Reads one stream of `Put`/`Delta`/`Symlink` frames up to its `End`, writing the files
+    /// into `root`. Returns the paths whose delta rebuilt to the wrong hash.
+    fn receive(&mut self, root: &Path, index: &mut Index, stats: &mut Stats) -> Result<Vec<String>> {
         let mut inbox = Inbox::default();
         let mut failed = Vec::new();
         loop {
@@ -420,6 +354,86 @@ impl Session {
     }
 }
 
+fn recv(reader: &mut BufReader<ChildStdout>) -> Result<Resp> {
+    match read_frame(reader)? {
+        Resp::Error { msg } => bail!("remote: {msg}"),
+        r => Ok(r),
+    }
+}
+
+/// Streams the output of the `Exec` queued earlier, remote paths rewritten to local ones.
+/// Returns the exit code. Works on the reader alone: the writer is busy on the scan thread
+/// meanwhile (see `run`).
+fn exec_output(reader: &mut BufReader<ChildStdout>, remote_home: &str, remote_dir: &str, local_root: &Path) -> Result<i32> {
+    // the remote project path (`~` expanded with the agent's home) for output rewriting
+    let remote_abs = match remote_dir.strip_prefix("~/") {
+        Some(r) => format!("{remote_home}/{r}"),
+        None => remote_dir.to_string(),
+    };
+    let local = local_root.to_string_lossy().into_owned();
+    let mut out_rw = LineRewriter::new(&remote_abs, &local);
+    let mut err_rw = LineRewriter::new(&remote_abs, &local);
+    let stdout = io::stdout();
+    let stderr = io::stderr();
+    loop {
+        match recv(reader)? {
+            Resp::Output { stderr: is_err, data } => {
+                if is_err {
+                    let mut h = stderr.lock();
+                    h.write_all(&err_rw.feed(&data))?;
+                    h.flush()?;
+                } else {
+                    let mut h = stdout.lock();
+                    h.write_all(&out_rw.feed(&data))?;
+                    h.flush()?;
+                }
+            }
+            Resp::Exit { code } => {
+                stdout.lock().write_all(&out_rw.flush())?;
+                stderr.lock().write_all(&err_rw.flush())?;
+                return Ok(code);
+            }
+            other => bail!("unexpected reply {other:?}"),
+        }
+    }
+}
+
+/// The `Pull` request: the local manifest of the download scope plus the block signatures of
+/// its big files, so the agent can answer with deltas without another round trip. Built while
+/// the command runs; the signatures come from the `Sigs` cache except for files that changed since.
+fn pull_request(root: &Path, remote_dir: &str, exclude: &[String], local: Vec<Entry>) -> Result<Req> {
+    let mut cache = Sigs::open(root);
+    let big: Vec<&Entry> = local
+        .iter()
+        .filter(|e| e.kind == Kind::File && delta::delta_worthwhile(e.size))
+        .collect();
+    cache.retain(&big.iter().map(|e| e.path.as_str()).collect());
+    let fresh = big
+        .par_iter()
+        .filter(|e| cache.get(&e.path, e.size, e.mtime_ns).is_none())
+        .map(|e| Ok((*e, delta::signature(&root.join(&e.path))?)))
+        .collect::<Result<Vec<_>>>()?;
+    for (e, sig) in fresh {
+        cache.insert(&e.path, e.size, e.mtime_ns, sig);
+    }
+    let sigs: Vec<(String, proto::Signature)> = big
+        .iter()
+        .map(|e| {
+            (
+                e.path.clone(),
+                cache.get(&e.path, e.size, e.mtime_ns).expect("just inserted").clone(),
+            )
+        })
+        .collect();
+    cache.save();
+    Ok(Req::Pull {
+        dir: remote_dir.into(),
+        exclude: exclude.to_vec(),
+        have: local,
+        sigs,
+    })
+}
+
 pub struct RunOptions {
     pub push: bool,
     pub pull: bool,
@@ -446,7 +460,15 @@ fn secs(t: Instant) -> String {
 pub fn run(root: &Path, cfg: &Config, cmd: &[String], opts: &RunOptions) -> Result<i32> {
     let start = Instant::now();
     let remote_dir = cfg.remote_dir(root);
-    let mut session = match Session::connect(cfg) {
+    let push_excludes = cfg.upload_excludes();
+    let pull_excludes = cfg.download_excludes();
+    // the push's `Manifest` request rides with the handshake: the agent scans its copy while the
+    // `Hello` reply is still on its way here
+    let first = opts.push.then(|| Req::Manifest {
+        dir: remote_dir.clone(),
+        exclude: push_excludes.clone(),
+    });
+    let mut session = match Session::connect(cfg, first.as_ref()) {
         Ok(s) => s,
         Err(e) if cfg.fallback && !cmd.is_empty() => {
             eprintln!("mirako: {e:#}");
@@ -467,10 +489,9 @@ pub fn run(root: &Path, cfg: &Config, cmd: &[String], opts: &RunOptions) -> Resu
         cfg.host
     ));
     let mut index = Index::open(root);
-    let pull_excludes = cfg.download_excludes();
 
-    // the requests of the later phases go out with the push's `Flush`, so the agent starts the
-    // command, and then its pull scan, without waiting for another round trip
+    // the `Exec` goes out with the push's `Flush`, so the agent starts the command without
+    // waiting for another round trip
     let mut after = Vec::new();
     if !cmd.is_empty() {
         after.push(Req::Exec {
@@ -478,16 +499,10 @@ pub fn run(root: &Path, cfg: &Config, cmd: &[String], opts: &RunOptions) -> Resu
             cmd: cmd.to_vec(),
         });
     }
-    if opts.pull {
-        after.push(Req::Manifest {
-            dir: remote_dir.clone(),
-            exclude: pull_excludes.clone(),
-        });
-    }
 
     if opts.push {
         let t = Instant::now();
-        let s = session.push(root, &mut index, &remote_dir, &cfg.upload_excludes(), &after)?;
+        let s = session.push(root, &mut index, &remote_dir, &push_excludes, &after)?;
         index.save();
         say(format!(
             "push   {} files ({} as delta), {} → {} on the wire, {} deleted, {}",
@@ -505,24 +520,74 @@ pub fn run(root: &Path, cfg: &Config, cmd: &[String], opts: &RunOptions) -> Resu
         session.writer.flush()?;
     }
 
-    // the local side of the pull is scanned on its own thread while the command runs remotely
+    // housekeeping on the host: stale mirrors, intermediates the client never downloads (only
+    // once they are not needed any more, i.e. after a pull), Gradle's retention. Never fails a
+    // build. When it leaves the current copy alone it is queued right behind the `Pull`, so its
+    // report comes back in the same stream; deleting `gc_after_pull` inside the copy has to wait
+    // until the pull, retries included, is complete.
+    let gc_req = (cfg.gc_days > 0 || (opts.pull && !cfg.gc_after_pull.is_empty())).then(|| GcReq {
+        folder: cfg.remote_folder.clone(),
+        keep_days: (cfg.gc_days > 0).then_some(cfg.gc_days),
+        current: Some(remote_dir.clone()),
+        build: if opts.pull { cfg.gc_after_pull.clone() } else { Vec::new() },
+        gradle_days: cfg.gc_days,
+        dry_run: false,
+        sizes: false,
+    });
+    let gc_queued = opts.pull && gc_req.as_ref().is_some_and(|g| g.build.is_empty());
+    let (queued_gc, later_gc) = if gc_queued { (gc_req, None) } else { (None, gc_req) };
+
+    // while the command runs remotely, the local side of the pull is scanned on its own thread
+    // and sent up as the `Pull` request, so the agent streams the outputs the moment the command
+    // exits; the main thread meanwhile prints the command's output
     let mut code = 0;
-    let local = thread::scope(|scope| -> Result<Option<Vec<Entry>>> {
-        let scan = scope.spawn(|| match opts.pull {
-            true => index.scan(root, &Matcher::new(&pull_excludes)?).map(Some),
-            false => Ok(None),
+    let Session {
+        reader,
+        writer,
+        remote_home,
+        ..
+    } = &mut session;
+    thread::scope(|scope| -> Result<()> {
+        let scan = scope.spawn(|| -> Result<()> {
+            if !opts.pull {
+                return Ok(());
+            }
+            let local = index.scan(root, &Matcher::new(&pull_excludes)?)?;
+            write_frame(writer, &pull_request(root, &remote_dir, &pull_excludes, local)?)?;
+            if let Some(req) = queued_gc {
+                write_frame(writer, &Req::Gc(req))?;
+            }
+            Ok(writer.flush()?)
         });
         if !cmd.is_empty() {
             let t = Instant::now();
-            code = session.exec_output(&remote_dir, root)?;
+            code = exec_output(reader, remote_home, &remote_dir, root)?;
             say(format!("exec   exit {code}, {}", secs(t)));
         }
         scan.join().expect("scan thread panicked")
     })?;
 
-    if let Some(local) = local {
+    let report = |r: Result<GcReport>| match r {
+        Ok(r) => {
+            let mut parts: Vec<String> = r
+                .mirrors
+                .iter()
+                .filter(|m| m.removed)
+                .map(|m| format!("{} removed ({}, unused {} d)", m.name, human(m.bytes), m.idle_days.unwrap_or(0)))
+                .collect();
+            if r.build_bytes > 0 {
+                parts.push(format!("{} of intermediates deleted", human(r.build_bytes)));
+            }
+            if !parts.is_empty() {
+                parts.push(format!("{} free", human(r.free)));
+                say(format!("gc     {}", parts.join(", ")));
+            }
+        }
+        Err(e) => eprintln!("mirako: gc: {e:#}"),
+    };
+    if opts.pull {
         let t = Instant::now();
-        let s = session.pull(root, &mut index, &remote_dir, local)?;
+        let (s, gc) = session.pull(root, &mut index, &remote_dir, gc_queued)?;
         index.save();
         say(format!(
             "pull   {} files ({} as delta), {} → {} on the wire, {}",
@@ -532,38 +597,12 @@ pub fn run(root: &Path, cfg: &Config, cmd: &[String], opts: &RunOptions) -> Resu
             human(s.wire),
             secs(t)
         ));
-    }
-
-    // housekeeping on the host: stale mirrors, intermediates the client never downloads (only
-    // once they are not needed any more, i.e. after a pull), Gradle's retention. Never fails a build.
-    if cfg.gc_days > 0 || (opts.pull && !cfg.gc_after_pull.is_empty()) {
-        let req = GcReq {
-            folder: cfg.remote_folder.clone(),
-            keep_days: (cfg.gc_days > 0).then_some(cfg.gc_days),
-            current: Some(remote_dir.clone()),
-            build: if opts.pull { cfg.gc_after_pull.clone() } else { Vec::new() },
-            gradle_days: cfg.gc_days,
-            dry_run: false,
-            sizes: false,
-        };
-        match session.gc(req) {
-            Ok(r) => {
-                let mut parts: Vec<String> = r
-                    .mirrors
-                    .iter()
-                    .filter(|m| m.removed)
-                    .map(|m| format!("{} removed ({}, unused {} d)", m.name, human(m.bytes), m.idle_days.unwrap_or(0)))
-                    .collect();
-                if r.build_bytes > 0 {
-                    parts.push(format!("{} of intermediates deleted", human(r.build_bytes)));
-                }
-                if !parts.is_empty() {
-                    parts.push(format!("{} free", human(r.free)));
-                    say(format!("gc     {}", parts.join(", ")));
-                }
-            }
-            Err(e) => eprintln!("mirako: gc: {e:#}"),
+        if let Some(r) = gc {
+            report(r);
         }
+    }
+    if let Some(req) = later_gc {
+        report(session.gc(req));
     }
     session.close();
     say(format!("total  {}", secs(start)));
@@ -573,7 +612,7 @@ pub fn run(root: &Path, cfg: &Config, cmd: &[String], opts: &RunOptions) -> Resu
 /// `mirako gc`: list the project copies on the host and remove the stale ones.
 pub fn gc(cfg: &Config, days: Option<u32>, dry_run: bool) -> Result<()> {
     let keep = days.or((cfg.gc_days > 0).then_some(cfg.gc_days));
-    let mut session = Session::connect(cfg)?;
+    let mut session = Session::connect(cfg, None)?;
     let r = session.gc(GcReq {
         folder: cfg.remote_folder.clone(),
         keep_days: keep,
@@ -626,7 +665,7 @@ pub fn run_local(root: &Path, cmd: &[String]) -> Result<i32> {
 
 /// Quick reachability + version handshake; used by the Gradle shim before hijacking a build.
 pub fn check(cfg: &Config) -> Result<()> {
-    let s = Session::connect(cfg)?;
+    let s = Session::connect(cfg, None)?;
     let os = s.remote_os.clone();
     s.close();
     println!("mirako {}: {} ok ({os})", proto::VERSION, cfg.host);

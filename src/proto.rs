@@ -3,6 +3,10 @@
 //!
 //! Transfers are pipelined: the sender streams `Put`/`Delta` frames without waiting and only
 //! `Flush` is answered, so the round-trip latency of the link is paid once per phase, not per file.
+//! Requests are queued ahead of the replies they do not depend on, too: `Hello` and the push's
+//! `Manifest` go out in one write, `Exec` rides behind the push's `Flush`, and the client sends
+//! `Pull` (its manifest of the download scope plus block signatures) while the command runs, so
+//! the agent streams the outputs the moment it exits.
 
 use anyhow::{bail, Context, Result};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
@@ -144,10 +148,18 @@ pub enum Req {
         dir: String,
         cmd: Vec<String>,
     },
-    /// `sigs` carries the local old copies' signatures: those files come back as deltas.
+    /// Resend `paths` of the download scope whole (deltas that rebuilt to the wrong hash); ends with `End`.
     Fetch {
         dir: String,
         paths: Vec<String>,
+    },
+    /// The download: `have` is the client's manifest of `dir` minus `exclude` and `sigs` the block
+    /// signatures of its big files. The agent scans its copy, streams every entry that differs
+    /// (`Put`, or `Delta` against the signature, or `Symlink`) and ends with `End`.
+    Pull {
+        dir: String,
+        exclude: Vec<String>,
+        have: Vec<Entry>,
         sigs: Vec<(String, Signature)>,
     },
     /// Housekeeping on the host; answered with `Gc`.
@@ -327,22 +339,37 @@ mod tests {
     }
 
     #[test]
-    fn fetch_with_a_signature_survives_a_frame_roundtrip() {
+    fn pull_with_a_signature_survives_a_frame_roundtrip() {
         let sig = Signature {
             block: 65536,
             size: 65536 + 7,
             blocks: vec![(0xdead_beef, [1; 16]), (42, [2; 16])],
         };
-        let req = Req::Fetch {
+        let req = Req::Pull {
             dir: "/r/app".into(),
-            paths: vec!["app/build/x.apk".into()],
+            exclude: vec!["src".into()],
+            have: vec![Entry {
+                path: "app/build/x.apk".into(),
+                kind: Kind::File,
+                size: 65543,
+                mtime_ns: -1,
+                mode: 0o644,
+                hash: [9; 32],
+            }],
             sigs: vec![("app/build/x.apk".into(), sig)],
         };
-        let Req::Fetch { dir, paths, sigs } = roundtrip(&req) else {
+        let Req::Pull { dir, exclude, have, sigs } = roundtrip(&req) else {
             panic!("wrong variant")
         };
         assert_eq!(dir, "/r/app");
-        assert_eq!(paths, vec!["app/build/x.apk".to_string()]);
+        assert_eq!(exclude, vec!["src".to_string()]);
+        assert_eq!(have.len(), 1);
+        assert_eq!(have[0].path, "app/build/x.apk");
+        assert_eq!(have[0].kind, Kind::File);
+        assert_eq!(
+            (have[0].size, have[0].mtime_ns, have[0].mode, have[0].hash),
+            (65543, -1, 0o644, [9; 32])
+        );
         assert_eq!(sigs.len(), 1);
         assert_eq!(sigs[0].0, "app/build/x.apk");
         assert_eq!((sigs[0].1.block, sigs[0].1.size), (65536, 65543));

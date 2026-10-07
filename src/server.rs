@@ -5,7 +5,7 @@ use crate::delta;
 use crate::gc;
 use crate::index::{self, Index};
 use crate::patterns::Matcher;
-use crate::proto::{self, read_frame, write_frame, Chunk, DeltaChunk, Req, Resp, CHUNK};
+use crate::proto::{self, read_frame, write_frame, Chunk, DeltaChunk, Entry, Kind, Req, Resp, Signature, CHUNK};
 use crate::xfer::{safe_join, Inbox};
 use anyhow::{bail, Context, Result};
 use std::collections::HashMap;
@@ -58,9 +58,6 @@ pub fn serve() -> Result<()> {
         };
         let result: Result<()> = (|| match req {
             Req::Hello { version } => {
-                if version != proto::VERSION {
-                    eprintln!("mirako serve {}: client is {version}", proto::VERSION);
-                }
                 send(
                     &out,
                     &Resp::Hello {
@@ -68,18 +65,18 @@ pub fn serve() -> Result<()> {
                         home: dirs::home_dir().unwrap_or_default().to_string_lossy().into_owned(),
                         os: format!("{} {}", std::env::consts::OS, std::env::consts::ARCH),
                     },
-                )
+                )?;
+                if version != proto::VERSION {
+                    // the client bails on that reply; whatever it queued behind its `Hello` was
+                    // written for another protocol, so do not read on
+                    eprintln!("mirako serve {}: client is {version}", proto::VERSION);
+                    std::process::exit(0);
+                }
+                Ok(())
             }
             Req::Manifest { dir, exclude } => {
-                let root = expand_home(&dir);
-                fs::create_dir_all(&root)?;
-                let root = root.canonicalize()?;
-                let matcher = Matcher::new(&exclude)?;
-                if index.as_ref().map(|(r, _)| r != &root).unwrap_or(true) {
-                    index = Some((root.clone(), Index::open(&root)));
-                }
-                let idx = &mut index.as_mut().unwrap().1;
-                let entries = idx.scan(&root, &matcher)?;
+                let (root, idx) = open_root(&mut index, &dir)?;
+                let entries = idx.scan(root, &Matcher::new(&exclude)?)?;
                 idx.save();
                 send(
                     &out,
@@ -150,17 +147,31 @@ pub fn serve() -> Result<()> {
                 }
                 exec(&out, &expand_home(&dir), &cmd)
             }
-            Req::Fetch { dir, paths, sigs } => {
+            Req::Pull { dir, exclude, have, sigs } => {
+                let (root, idx) = open_root(&mut index, &dir)?;
+                let entries = idx.scan(root, &Matcher::new(&exclude)?)?;
+                idx.save();
+                let have: HashMap<&str, &Entry> = have.iter().map(|e| (e.path.as_str(), e)).collect();
+                let sigs: HashMap<String, Signature> = sigs.into_iter().collect();
+                for e in &entries {
+                    let differs = have
+                        .get(e.path.as_str())
+                        .map(|l| l.hash != e.hash || l.kind != e.kind)
+                        .unwrap_or(true);
+                    if differs {
+                        send_entry(&out, root, e, sigs.get(&e.path))?;
+                    }
+                }
+                send(&out, &Resp::End)
+            }
+            Req::Fetch { dir, paths } => {
                 let root = expand_home(&dir).canonicalize()?;
-                let sigs: HashMap<String, _> = sigs.into_iter().collect();
                 for p in paths {
                     let full = safe_join(&root, &p)?;
                     let md = fs::symlink_metadata(&full)?;
                     if md.file_type().is_symlink() {
                         let target = fs::read_link(&full)?.to_string_lossy().into_owned();
                         stream(&out, &Resp::Symlink { path: p, target })?;
-                    } else if let Some(sig) = sigs.get(&p).filter(|_| delta::delta_worthwhile(md.len())) {
-                        send_delta(&out, &full, &p, &md, sig)?;
                     } else {
                         send_file(&out, &full, &p, &md)?;
                     }
@@ -173,6 +184,40 @@ pub fn serve() -> Result<()> {
         if let Err(e) = result {
             eprintln!("mirako serve: {e:#}");
             send(&out, &Resp::Error { msg: format!("{e:#}") })?;
+        }
+    }
+}
+
+/// The mirror `dir` (created if missing) and the agent's index of it, kept across requests.
+fn open_root<'a>(index: &'a mut Option<(PathBuf, Index)>, dir: &str) -> Result<(&'a Path, &'a mut Index)> {
+    let root = expand_home(dir);
+    fs::create_dir_all(&root)?;
+    let root = root.canonicalize()?;
+    if index.as_ref().map(|(r, _)| r != &root).unwrap_or(true) {
+        *index = Some((root.clone(), Index::open(&root)));
+    }
+    let (root, idx) = index.as_mut().unwrap();
+    Ok((root.as_path(), idx))
+}
+
+/// Stream one entry of the download scope: a symlink as is, a big file the client holds a
+/// signature of as a delta, anything else whole.
+fn send_entry(out: &Out, root: &Path, e: &Entry, sig: Option<&Signature>) -> Result<()> {
+    match &e.kind {
+        Kind::Symlink { target } => stream(
+            out,
+            &Resp::Symlink {
+                path: e.path.clone(),
+                target: target.clone(),
+            },
+        ),
+        Kind::File => {
+            let full = root.join(&e.path);
+            let md = fs::metadata(&full)?;
+            match sig.filter(|_| delta::delta_worthwhile(e.size)) {
+                Some(sig) => send_delta(out, &full, &e.path, &md, e.hash, sig),
+                None => send_file(out, &full, &e.path, &md),
+            }
         }
     }
 }
@@ -209,15 +254,16 @@ fn send_file(out: &Out, full: &Path, rel: &str, md: &fs::Metadata) -> Result<()>
     Ok(())
 }
 
-/// Stream one file as `Resp::Delta` chunks against the client's signature.
-fn send_delta(out: &Out, full: &Path, rel: &str, md: &fs::Metadata, sig: &proto::Signature) -> Result<()> {
+/// Stream one file as `Resp::Delta` chunks against the client's signature. `hash` is the file's
+/// blake3 from the scan that found it changed; the client checks the rebuilt file against it.
+fn send_delta(out: &Out, full: &Path, rel: &str, md: &fs::Metadata, hash: [u8; 32], sig: &Signature) -> Result<()> {
     let data = fs::read(full)?;
     let head = DeltaChunk {
         path: rel.into(),
         mode: md.permissions().mode() & 0o7777,
         mtime_ns: index::mtime_ns(md),
         size: data.len() as u64,
-        hash: *blake3::hash(&data).as_bytes(),
+        hash,
         ops: Vec::new(),
         last: false,
     };

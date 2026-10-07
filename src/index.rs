@@ -2,12 +2,12 @@
 //! mtime changed, so a warm scan of a few thousand files takes milliseconds.
 
 use crate::patterns::Matcher;
-use crate::proto::{Entry, Kind};
+use crate::proto::{Entry, Kind, Signature};
 use anyhow::{Context, Result};
 use filetime::FileTime;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -171,6 +171,64 @@ impl Index {
     }
 }
 
+#[derive(Serialize, Deserialize, Default)]
+struct SigCache {
+    // path -> (size, mtime_ns, signature)
+    files: HashMap<String, (u64, i64, Signature)>,
+}
+
+/// Block signatures of the local big files of the download scope, cached like the hashes: a
+/// signature is recomputed only when the file's size or mtime changed, so sending them all with
+/// every `Pull` costs a lookup, not a read of every APK under `build/`. Client side only, in a
+/// `.sig` file next to the root's `.idx`.
+pub struct Sigs {
+    file: PathBuf,
+    cache: SigCache,
+    dirty: bool,
+}
+
+impl Sigs {
+    pub fn open(root: &Path) -> Self {
+        let file = Index::cache_path(root).with_extension("sig");
+        let cache = fs::read(&file).ok().and_then(|b| bincode::deserialize(&b).ok()).unwrap_or_default();
+        Self { file, cache, dirty: false }
+    }
+
+    /// The cached signature of `rel`, if the file still has that size and mtime.
+    pub fn get(&self, rel: &str, size: u64, mtime_ns: i64) -> Option<&Signature> {
+        match self.cache.files.get(rel) {
+            Some((s, mt, sig)) if *s == size && *mt == mtime_ns => Some(sig),
+            _ => None,
+        }
+    }
+
+    pub fn insert(&mut self, rel: &str, size: u64, mtime_ns: i64, sig: Signature) {
+        self.cache.files.insert(rel.to_string(), (size, mtime_ns, sig));
+        self.dirty = true;
+    }
+
+    /// Drops the entries of files not in `keep` (gone, or shrunk below the delta range).
+    pub fn retain(&mut self, keep: &HashSet<&str>) {
+        let before = self.cache.files.len();
+        self.cache.files.retain(|p, _| keep.contains(p.as_str()));
+        self.dirty |= self.cache.files.len() != before;
+    }
+
+    /// Writes the cache when it changed.
+    pub fn save(&mut self) {
+        if !self.dirty {
+            return;
+        }
+        if let Ok(bytes) = bincode::serialize(&self.cache) {
+            let tmp = self.file.with_extension("sig.tmp");
+            if fs::write(&tmp, bytes).is_ok() {
+                let _ = fs::rename(&tmp, &self.file);
+            }
+        }
+        self.dirty = false;
+    }
+}
+
 /// `.mirako.<name>.tmp`, what `xfer::Inbox` writes before the rename into place.
 fn is_leftover_tmp(name: &str) -> bool {
     name.starts_with(".mirako.") && name.ends_with(".tmp")
@@ -193,9 +251,18 @@ pub fn mtime_ns(md: &fs::Metadata) -> i64 {
         .unwrap_or_else(|| md.mtime() * 1_000_000_000)
 }
 
+/// From this size up blake3 maps the file and hashes it on all cores: an 84 MB APK takes ~10 ms
+/// instead of ~45. Below it the read loop is cheaper than the setup.
+const MMAP_MIN: u64 = 1 << 20;
+
 pub fn hash_file(path: &Path) -> Result<[u8; 32]> {
     let mut h = blake3::Hasher::new();
-    h.update_reader(fs::File::open(path)?)?;
+    let f = fs::File::open(path)?;
+    if f.metadata()?.len() >= MMAP_MIN {
+        h.update_mmap_rayon(path)?;
+    } else {
+        h.update_reader(f)?;
+    }
     Ok(*h.finalize().as_bytes())
 }
 
@@ -210,8 +277,9 @@ mod tests {
 
     impl Drop for CacheGuard {
         fn drop(&mut self) {
-            let _ = fs::remove_file(&self.0);
-            let _ = fs::remove_file(self.0.with_extension("tmp"));
+            for ext in ["idx", "tmp", "sig", "sig.tmp"] {
+                let _ = fs::remove_file(self.0.with_extension(ext));
+            }
         }
     }
 
@@ -250,6 +318,52 @@ mod tests {
         let md = fs::metadata(path).unwrap();
         let t = FileTime::from_last_modification_time(&md);
         filetime::set_file_mtime(path, FileTime::from_unix_time(t.unix_seconds() + secs, t.nanoseconds())).unwrap();
+    }
+
+    #[test]
+    fn big_files_hash_the_same_through_the_mmap_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("big.bin");
+        let data: Vec<u8> = (0..(MMAP_MIN as usize + 12345)).map(|i| (i % 251) as u8).collect();
+        fs::write(&p, &data).unwrap();
+        assert_eq!(hash_file(&p).unwrap(), *blake3::hash(&data).as_bytes());
+    }
+
+    #[test]
+    fn sigs_cache_hits_only_while_size_and_mtime_match_and_prunes_on_save() {
+        let (_g, _d, root) = project();
+        write(&root, "a.apk", &vec![1u8; 300_000]);
+        write(&root, "gone.apk", &vec![2u8; 300_000]);
+        let entries = scan(&root, &no_excludes());
+        let a = find(&entries, "a.apk");
+        let gone = find(&entries, "gone.apk");
+        let sig_a = crate::delta::signature(&root.join("a.apk")).unwrap();
+
+        let get = |s: &Sigs, e: &Entry| s.get(&e.path, e.size, e.mtime_ns).map(|sig| sig.blocks.clone());
+
+        let mut sigs = Sigs::open(&root);
+        assert!(get(&sigs, a).is_none());
+        sigs.insert(&a.path, a.size, a.mtime_ns, sig_a.clone());
+        let sig_gone = crate::delta::signature(&root.join("gone.apk")).unwrap();
+        sigs.insert(&gone.path, gone.size, gone.mtime_ns, sig_gone);
+        assert_eq!(get(&sigs, a).unwrap(), sig_a.blocks);
+        sigs.save();
+
+        // another run: the hits survive on disk; `gone.apk` goes once it is not retained
+        let mut again = Sigs::open(&root);
+        assert_eq!(get(&again, a).unwrap(), sig_a.blocks);
+        assert!(get(&again, gone).is_some());
+        again.retain(&["a.apk"].into_iter().collect());
+        again.save();
+        let third = Sigs::open(&root);
+        assert!(get(&third, gone).is_none());
+        assert!(get(&third, a).is_some());
+
+        // same path, different mtime or size: a miss
+        bump_mtime(&root.join("a.apk"), 1);
+        let entries = scan(&root, &no_excludes());
+        assert!(get(&third, find(&entries, "a.apk")).is_none());
+        assert!(third.get("a.apk", a.size - 1, a.mtime_ns).is_none());
     }
 
     #[test]

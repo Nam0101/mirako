@@ -18,7 +18,9 @@ build outputs back. It is a single Rust binary, installed on both ends, in the s
   block deltas (64 KB blocks, rolling checksum + blake3). An 84 MB APK rebuilt after a
   one-line change comes back as ~200 KB on the wire.
 - **zstd, pipelined, one ssh session.** Every phase (push, exec, pull) runs on the same
-  connection; transfers stream without per-file round trips.
+  connection; transfers stream without per-file round trips, and the requests of each phase
+  are queued ahead of the replies they do not need: the whole round trip of a no-op run is
+  three link latencies (handshake + push manifest, flush + exec, pull).
 - **Never deletes locally.** The upload mirrors the remote to your sources (deletes there);
   the download only adds or replaces files. Your `.git`, `local.properties` and IDE state
   are untouched.
@@ -127,13 +129,19 @@ finishes.
 
 ```
 ╭──────────── local ────────────╮        ssh         ╭──────────── remote ───────────╮
-│ scan + blake3 index (cached)  │ ──── manifest ───▶ │ scan + blake3 index (cached)  │
+│ scan + blake3 index (cached)  │ ◀─── manifest ──── │ scan + blake3 index (cached)  │
 │ diff → Put / Delta / Delete   │ ═══ zstd frames ═▶ │ apply into tmp, rename        │
 │ Exec                          │ ──────────────────▶│ ./gradlew …  (MIRAKO_REMOTE=1)│
 │ rewrite paths, print          │ ◀═══ Output ═══════│                               │
-│ diff ← manifest, send sigs    │ ◀═ Put / Delta ═══ │ rolling-checksum delta vs sig │
+│ meanwhile: scan outputs, sigs │ ── Pull ─────────▶ │ scan, diff against the client │
+│ apply into tmp, rename        │ ◀═ Put / Delta ═══ │ rolling-checksum delta vs sig │
 ╰───────────────────────────────╯                    ╰───────────────────────────────╯
 ```
+
+The download is driven by the client's own manifest: while the command runs, the client
+scans its copy of the download scope, computes block signatures of its big files and sends
+both up, so the moment the command exits the agent streams exactly what differs, deltas
+included, without another exchange.
 
 The protocol is length-prefixed bincode frames on the agent's stdin/stdout (`mirako serve`),
 so nothing listens on a port and ssh handles auth and encryption.
