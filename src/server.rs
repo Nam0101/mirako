@@ -13,10 +13,57 @@ use std::fs;
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
+use std::time::Duration;
 
 type Out = Arc<Mutex<BufWriter<io::Stdout>>>;
+
+/// Requests read ahead of the one being served. Few, so a push still meets back-pressure, and
+/// enough for what the client queues behind an `Exec` (`Pull`, `Gc`): the reader thread is then
+/// back in `read` and sees the client go away while the command runs.
+const READ_AHEAD: usize = 4;
+
+/// What a cancelled command gets between SIGTERM and SIGKILL.
+const GRACE: Duration = Duration::from_secs(2);
+
+/// Shared by the reader thread and `exec`: whether the client hung up, and the process group of
+/// the command that has to stop when it does (0: none running).
+#[derive(Default)]
+struct Hangup {
+    gone: AtomicBool,
+    group: AtomicI32,
+}
+
+impl Hangup {
+    /// The client went away (a cancelled build): SIGTERM to the running command and everything
+    /// it started, SIGKILL after `GRACE` to a command that is still the one running then.
+    fn stop(&self) {
+        let group = self.group.load(Ordering::SeqCst);
+        if group == 0 {
+            return;
+        }
+        signal_group(group, false);
+        thread::sleep(GRACE);
+        // unchanged: `exec` is still on it, so the command or something it started lives, and while
+        // one of them does the id cannot have gone to another group
+        if self.group.load(Ordering::SeqCst) == group {
+            signal_group(group, true);
+        }
+    }
+}
+
+/// SIGTERM, or with `force` SIGKILL, to every process of the group.
+#[cfg(unix)]
+fn signal_group(group: i32, force: bool) {
+    // SAFETY: a plain syscall; a group that is gone already answers ESRCH
+    unsafe { libc::killpg(group, if force { libc::SIGKILL } else { libc::SIGTERM }) };
+}
+
+/// A Windows host is not supported: the command there runs on.
+#[cfg(not(unix))]
+fn signal_group(_: i32, _: bool) {}
 
 fn send(out: &Out, resp: &Resp) -> Result<()> {
     let mut w = out.lock().unwrap();
@@ -41,8 +88,24 @@ pub fn expand_home(p: &str) -> PathBuf {
 }
 
 pub fn serve() -> Result<()> {
-    let mut input = BufReader::new(io::stdin());
     let out: Out = Arc::new(Mutex::new(BufWriter::new(io::stdout())));
+    // requests are read on a thread of their own: the loop below is busy while a command runs,
+    // and a client that closes the connection then (a cancelled build) has to stop that command
+    let hangup = Arc::new(Hangup::default());
+    let (queue, requests) = mpsc::sync_channel::<Req>(READ_AHEAD);
+    thread::spawn({
+        let hangup = hangup.clone();
+        move || {
+            let mut input = BufReader::new(io::stdin());
+            while let Ok(req) = read_frame(&mut input) {
+                if queue.send(req).is_err() {
+                    return;
+                }
+            }
+            hangup.gone.store(true, Ordering::SeqCst);
+            hangup.stop();
+        }
+    });
     let mut inbox = Inbox::default();
     let mut index: Option<(PathBuf, Index)> = None;
     let mut failed_deltas: Vec<String> = Vec::new();
@@ -51,10 +114,14 @@ pub fn serve() -> Result<()> {
     let mut blocked = false;
 
     loop {
-        let req: Req = match read_frame(&mut input) {
-            Ok(r) => r,
-            Err(_) => return Ok(()), // client went away
+        let Ok(req) = requests.recv() else {
+            return Ok(()); // client went away
         };
+        if hangup.gone.load(Ordering::SeqCst) {
+            // and so it did, with requests read ahead: nobody waits for their answers, and its next
+            // run may be at work in this tree already
+            return Ok(());
+        }
         let result: Result<()> = (|| match req {
             Req::Hello { version } => {
                 send(
@@ -140,11 +207,11 @@ pub fn serve() -> Result<()> {
                 blocked = !failed.is_empty();
                 send(&out, &Resp::Ack { failed })
             }
-            Req::Exec { dir, cmd } => {
+            Req::Exec { dir, cmd, env } => {
                 if blocked {
                     bail!("a delta push did not rebuild; waiting for the resend before running anything");
                 }
-                exec(&out, &expand_home(&dir), &cmd)
+                exec(&out, &hangup, &expand_home(&dir), &cmd, env)
             }
             Req::Pull { dir, exclude, have, sigs } => {
                 let (root, idx) = open_root(&mut index, &dir)?;
@@ -281,21 +348,32 @@ pub fn read_full<R: Read>(r: &mut R, buf: &mut [u8]) -> io::Result<usize> {
     Ok(n)
 }
 
-fn exec(out: &Out, dir: &Path, cmd: &[String]) -> Result<()> {
+fn exec(out: &Out, hangup: &Arc<Hangup>, dir: &Path, cmd: &[String], env: Vec<(String, String)>) -> Result<()> {
     let Some((prog, args)) = cmd.split_first() else {
         bail!("empty command")
     };
-    let mut child = Command::new(prog)
+    let mut command = Command::new(prog);
+    command
         .args(args)
         .current_dir(dir)
+        .envs(env)
         .env("MIRAKO_REMOTE", "1")
         .env("LANG", "C.UTF-8")
         .env("LC_CTYPE", "C.UTF-8")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .with_context(|| format!("starting `{prog}` in {}", dir.display()))?;
+        .stderr(Stdio::piped());
+    // a process group of its own, so that a hang-up stops what the command started as well
+    #[cfg(unix)]
+    std::os::unix::process::CommandExt::process_group(&mut command, 0);
+    let mut child = command.spawn().with_context(|| format!("starting `{prog}` in {}", dir.display()))?;
+    let group = child.id() as i32;
+    hangup.group.store(group, Ordering::SeqCst);
+    if hangup.gone.load(Ordering::SeqCst) {
+        // the client left between its `Exec` and this spawn: the reader thread found nothing to stop
+        let hangup = hangup.clone();
+        thread::spawn(move || hangup.stop());
+    }
     let stdout = child.stdout.take().unwrap();
     let stderr = child.stderr.take().unwrap();
     let pump = |mut src: Box<dyn Read + Send>, is_err: bool, out: Out| {
@@ -324,8 +402,15 @@ fn exec(out: &Out, dir: &Path, cmd: &[String]) -> Result<()> {
     let t1 = pump(Box::new(stdout), false, out.clone());
     let t2 = pump(Box::new(stderr), true, out.clone());
     let status = child.wait()?;
+    if hangup.gone.load(Ordering::SeqCst) {
+        // whatever of its group outlived the command
+        signal_group(group, true);
+    }
+    // the group stays registered while the pumps run: what the command left behind holds their
+    // pipes open, and a hang-up from here on has that to stop
     let _ = t1.join();
     let _ = t2.join();
+    hangup.group.store(0, Ordering::SeqCst);
     send(
         out,
         &Resp::Exit {

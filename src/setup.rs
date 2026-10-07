@@ -144,7 +144,7 @@ fn describe(host: &str, facts: &HashMap<&str, &str>) -> Vec<String> {
     }
     if get("android").is_empty() {
         lines.push(format!(
-            "warning: ANDROID_HOME (or ANDROID_SDK_ROOT) is unset on {host}: Android builds need it there, local.properties is never synced"
+            "warning: ANDROID_HOME (or ANDROID_SDK_ROOT) is unset on {host}: Android builds need it there, the `sdk.dir` of local.properties stays on this machine"
         ));
     }
     if free_kb > 0 && free_kb < LOW_DISK_KB {

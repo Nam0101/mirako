@@ -13,8 +13,8 @@ use anyhow::{bail, Context, Result};
 use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
-use std::fs;
-use std::io::{self, BufReader, BufWriter, Write};
+use std::fs::{self, TryLockError};
+use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdout, Command, Stdio};
 use std::thread;
@@ -187,7 +187,15 @@ impl Session {
     /// `Manifest` request went out with the handshake (`connect`), so the agent scans its copy
     /// while the local scan runs here. `after` is queued behind the final `Flush` (see `flush_and`).
     pub fn push(&mut self, root: &Path, index: &mut Index, remote_dir: &str, exclude: &[String], after: &[Req]) -> Result<Stats> {
-        let local = index.scan(root, &Matcher::new(exclude)?)?;
+        let mut local = index.scan(root, &Matcher::new(exclude)?)?;
+        // a `local.properties` goes up as `portable_properties` leaves it, so its entry describes that content
+        let mut portable: HashMap<String, Vec<u8>> = HashMap::new();
+        for e in local.iter_mut().filter(|e| e.kind == Kind::File && is_local_properties(&e.path)) {
+            let bytes = portable_properties(&fs::read(root.join(&e.path))?);
+            e.size = bytes.len() as u64;
+            e.hash = *blake3::hash(&bytes).as_bytes();
+            portable.insert(e.path.clone(), bytes);
+        }
         let remote = match self.recv()? {
             Resp::Manifest { entries, .. } => entries,
             other => bail!("unexpected reply {other:?}"),
@@ -244,7 +252,9 @@ impl Session {
                     target: target.clone(),
                 })?,
                 Kind::File => {
-                    if let Some(sig) = sigs.get(&e.path) {
+                    if let Some(bytes) = portable.get(&e.path) {
+                        stats.wire += self.send_from(e, bytes.as_slice())?;
+                    } else if let Some(sig) = sigs.get(&e.path) {
                         stats.wire += self.send_delta(root, e, sig)?;
                         stats.deltas += 1;
                     } else {
@@ -278,12 +288,17 @@ impl Session {
 
     fn send_file(&mut self, root: &Path, e: &Entry) -> Result<u64> {
         let full = root.join(&e.path);
-        let mut f = fs::File::open(&full).with_context(|| format!("reading {}", full.display()))?;
+        let f = fs::File::open(&full).with_context(|| format!("reading {}", full.display()))?;
+        self.send_from(e, f)
+    }
+
+    /// Streams `src`, the `e.size` bytes of `e`, as `Put` chunks. Returns the bytes on the wire.
+    fn send_from(&mut self, e: &Entry, mut src: impl Read) -> Result<u64> {
         let mut offset = 0u64;
         let mut wire = 0u64;
         let mut buf = vec![0u8; CHUNK];
         loop {
-            let n = read_full(&mut f, &mut buf)?;
+            let n = read_full(&mut src, &mut buf)?;
             let last = offset + n as u64 >= e.size || n == 0;
             let data = proto::compress(&buf[..n])?;
             wire += data.len() as u64;
@@ -458,6 +473,47 @@ fn exec_output(reader: &mut BufReader<ChildStdout>, remote_home: &str, remote_di
     }
 }
 
+/// The variables among `vars` that the `env` config key names (a name, or a prefix ending in
+/// `*`), sorted: what the remote command gets on top of the agent's own environment.
+fn forwarded_env(names: &[String], vars: impl Iterator<Item = (OsString, OsString)>) -> Vec<(String, String)> {
+    let named = |key: &str| {
+        names.iter().any(|n| match n.strip_suffix('*') {
+            Some(prefix) => key.starts_with(prefix),
+            None => n == key,
+        })
+    };
+    let mut env: Vec<(String, String)> = vars
+        .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)))
+        .filter(|(k, _)| named(k))
+        .collect();
+    env.sort();
+    env
+}
+
+/// Keys of `local.properties` that name a path of the machine the file was written on.
+const MACHINE_KEYS: [&[u8]; 3] = [b"sdk.dir", b"ndk.dir", b"cmake.dir"];
+
+fn is_local_properties(rel: &str) -> bool {
+    rel.rsplit('/').next() == Some("local.properties")
+}
+
+/// `local.properties` as the host gets it: without the lines of `MACHINE_KEYS` (the SDK is found
+/// there through `ANDROID_HOME`), every other key, the ones a build reads its secrets from, as it is.
+fn portable_properties(text: &[u8]) -> Vec<u8> {
+    let kept: Vec<&[u8]> = text
+        .split_inclusive(|&b| b == b'\n')
+        .filter(|line| {
+            let key = line
+                .trim_ascii_start()
+                .split(|b| b"=: \t\r\n".contains(b))
+                .next()
+                .unwrap_or_default();
+            !MACHINE_KEYS.contains(&key)
+        })
+        .collect();
+    kept.concat()
+}
+
 /// The `Pull` request: the local manifest of the download scope plus the block signatures of
 /// its big files, so the agent can answer with deltas without another round trip. Built while
 /// the command runs; the signatures come from the `Sigs` cache except for files that changed since.
@@ -516,10 +572,34 @@ fn secs(t: Instant) -> String {
     format!("{:.1}s", t.elapsed().as_secs_f64())
 }
 
+/// One run per project at a time, a second one waits here for the first: both would write the
+/// same files on either side, and a scan takes every `.mirako.*.tmp` it meets for a leftover and
+/// deletes it. The lock is the returned file (next to the project's index cache), held until it
+/// is dropped; a run that is killed lets go of it as well. A cache dir that cannot be written
+/// gives no lock, as it gives no index cache.
+fn lock_project(root: &Path) -> Result<Option<fs::File>> {
+    let path = Index::cache_path(root).with_extension("lock");
+    let _ = fs::create_dir_all(path.parent().unwrap());
+    // opened as it is, not truncated: another run may hold it locked
+    let Ok(file) = fs::OpenOptions::new().write(true).create(true).truncate(false).open(&path) else {
+        return Ok(None);
+    };
+    match file.try_lock() {
+        Ok(()) => {}
+        Err(TryLockError::WouldBlock) => {
+            eprintln!("mirako: another run of this project is in progress, waiting for it to finish");
+            file.lock()?;
+        }
+        Err(TryLockError::Error(e)) => return Err(e).with_context(|| format!("locking {}", path.display())),
+    }
+    Ok(Some(file))
+}
+
 /// The whole round trip. Returns the exit code to end the process with.
 pub fn run(root: &Path, cfg: &Config, cmd: &[String], opts: &RunOptions) -> Result<i32> {
     let start = Instant::now();
     refresh_shim();
+    let lock = lock_project(root)?;
     let remote_dir = cfg.remote_dir(root);
     let push_excludes = cfg.upload_excludes();
     let pull_excludes = cfg.download_excludes();
@@ -534,6 +614,8 @@ pub fn run(root: &Path, cfg: &Config, cmd: &[String], opts: &RunOptions) -> Resu
         Err(e) if cfg.fallback && !cmd.is_empty() => {
             eprintln!("mirako: {e:#}");
             eprintln!("mirako: running locally instead");
+            // nothing is synced from here on, and the command may be a `mirako run` of this project
+            drop(lock);
             return run_local(root, cmd);
         }
         Err(e) => return Err(e),
@@ -558,6 +640,7 @@ pub fn run(root: &Path, cfg: &Config, cmd: &[String], opts: &RunOptions) -> Resu
         after.push(Req::Exec {
             dir: remote_dir.clone(),
             cmd: cmd.to_vec(),
+            env: forwarded_env(&cfg.env, std::env::vars_os()),
         });
     }
 
@@ -860,6 +943,43 @@ mod tests {
             assert_eq!(wrapper, Path::new("./gradlew"));
         }
         assert_eq!(local_program(dir.path(), "echo"), OsString::from("echo"));
+    }
+
+    #[test]
+    fn forwarded_env_takes_the_named_variables_and_the_prefixed_ones() {
+        let vars = || {
+            [
+                ("PATH", "/bin"),
+                ("TOKEN", "t"),
+                ("TOKEN2", "no"),
+                ("ORG_GRADLE_PROJECT_b", "2"),
+                ("ORG_GRADLE_PROJECT_a", "1"),
+            ]
+            .into_iter()
+            .map(|(k, v)| (OsString::from(k), OsString::from(v)))
+        };
+        let names = |n: &[&str]| n.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let pair = |k: &str, v: &str| (k.to_string(), v.to_string());
+        assert_eq!(
+            forwarded_env(&names(&["TOKEN", "ORG_GRADLE_PROJECT_*", "UNSET"]), vars()),
+            vec![
+                pair("ORG_GRADLE_PROJECT_a", "1"),
+                pair("ORG_GRADLE_PROJECT_b", "2"),
+                pair("TOKEN", "t")
+            ]
+        );
+        assert!(forwarded_env(&[], vars()).is_empty());
+    }
+
+    #[test]
+    fn portable_properties_drops_the_keys_naming_local_paths_and_nothing_else() {
+        let text = b"# comment\nsdk.dir=/Users/me/Library/Android/sdk\nMAPS_API_KEY=abc\n  ndk.dir = /x\ncmake.dir:/y\r\nsdk.dirty=keep\nmirako.enabled=false\nlast=1";
+        let want = b"# comment\nMAPS_API_KEY=abc\nsdk.dirty=keep\nmirako.enabled=false\nlast=1";
+        assert_eq!(portable_properties(text), want);
+        assert_eq!(portable_properties(b"sdk.dir=/x"), b"");
+        assert_eq!(portable_properties(b""), b"");
+        assert!(is_local_properties("local.properties") && is_local_properties("app/local.properties"));
+        assert!(!is_local_properties("app/xlocal.properties") && !is_local_properties("local.properties/x"));
     }
 
     #[test]

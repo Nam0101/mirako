@@ -144,9 +144,12 @@ pub enum Req {
     },
     /// Answered with `Ack` once everything before it has been applied.
     Flush,
+    /// Run `cmd` in `dir`, with `env` (the client's variables its `env` config key names) on top
+    /// of the agent's environment.
     Exec {
         dir: String,
         cmd: Vec<String>,
+        env: Vec<(String, String)>,
     },
     /// Resend `paths` of the download scope whole (deltas that rebuilt to the wrong hash); ends with `End`.
     Fetch {
