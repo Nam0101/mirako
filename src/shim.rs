@@ -27,6 +27,12 @@ while (root != null && !new File(root, "gradlew").exists()) root = root.parentFi
 if (root == null) return
 def localProps = new File(root, "local.properties")
 if (localProps.exists() && localProps.text.contains("mirako.enabled=false")) return
+// tasks that talk to a device attached to this machine (adb), which the host has not. `install<Variant>` of a debug or
+// release variant becomes `assemble<Variant>` there and an `adb install` of the pulled APK here (adbInstall below);
+// any other one keeps the whole build local
+def installs = sp.taskNames.findAll { it ==~ /(.*:)?install([A-Z]\w*)?(Debug|Release)(AndroidTest)?/ }
+def deviceTask = sp.taskNames.find { !(it in installs) && it ==~ /(.*:)?((install|uninstall|connected)[A-Z]\w*|deviceCheck)/ }
+if (deviceTask != null) { println("mirako: $deviceTask may need a device attached to this machine, building locally"); return }
 
 def bin = System.getenv("MIRAKO_BIN") ?: "__BIN__"
 if (!new File(bin).canExecute()) { println("mirako: binary not found at $bin, building locally"); return }
@@ -35,7 +41,7 @@ __CHECK__
 
 // reconstruct the invocation for the remote ./gradlew
 def args = []
-args += sp.taskNames
+args += sp.taskNames.collect { it in installs ? it.replaceFirst(/(^|:)install(?=[A-Z]\w*$)/, '$1assemble') : it }
 sp.excludedTaskNames.each { args += ["-x", it] }
 sp.projectProperties.findAll { k, v -> k != "android.injected.attribution.file.location" }.each { k, v -> args += ["-P${k}=${v}".toString()] }
 sp.systemPropertiesArgs.each { k, v -> args += ["-D${k}=${v}".toString()] }
@@ -61,6 +67,44 @@ switch (sp.consoleOutput.toString()) {
     case "Rich":  args += ["--console", "rich"]; break
 }
 
+// `adb install`, on every device attached, of the APK that `assemble<Variant>` left under build/outputs/apk and the pull brought here
+def adbInstall = { String task ->
+    def name = task.tokenize(":").last().substring("install".length())
+    def variant = name[0].toLowerCase() + name.substring(1)
+    def base = new File(root, task.tokenize(":").dropRight(1).join("/"))
+    if (!base.directory) base = root
+    def apks = []
+    def skip = { File d -> d.name.startsWith(".") || d.name in ["src", "node_modules"] || (d.parentFile.name == "build" && d.name != "outputs") }
+    base.traverse(type: groovy.io.FileType.FILES, nameFilter: "output-metadata.json",
+            preDir: { skip(it) ? groovy.io.FileVisitResult.SKIP_SUBTREE : groovy.io.FileVisitResult.CONTINUE }) { meta ->
+        if (!meta.path.replace("\\", "/").contains("/build/outputs/apk/")) return
+        def json = new groovy.json.JsonSlurper().parse(meta)
+        if (json.artifactType?.type != "APK" || json.variantName != variant) return
+        if (json.elements.size() != 1) throw new GradleException("mirako: $variant has ${json.elements.size()} APKs (splits) and which one a device takes is AGP's call: run this build with -x mirako")
+        apks << new File(meta.parentFile, json.elements[0].outputFile)
+    }
+    if (apks.isEmpty()) throw new GradleException("mirako: no APK of variant $variant under $base (build/outputs/apk/**/output-metadata.json)")
+    def sdk = new Properties()
+    if (localProps.exists()) localProps.withInputStream { sdk.load(it) }
+    def home = sdk.getProperty("sdk.dir") ?: System.getenv("ANDROID_HOME") ?: System.getenv("ANDROID_SDK_ROOT")
+    def adb = home ? new File(home, "platform-tools/adb").path : "adb"
+    def run = { List<String> cmd ->
+        def proc = new ProcessBuilder(cmd).redirectErrorStream(true).start()
+        def out = proc.inputStream.text
+        [proc.waitFor(), out]
+    }
+    def listed = run([adb, "devices"])[1]
+    def devices = System.getenv("ANDROID_SERIAL") ? [System.getenv("ANDROID_SERIAL")] : listed.readLines().findAll { it.endsWith("\tdevice") }.collect { it.split("\t")[0] }
+    if (devices.isEmpty()) throw new GradleException("mirako: no device to install on:\n$listed")
+    devices.each { device ->
+        apks.each { apk ->
+            def (code, out) = run([adb, "-s", device, "install", "-r", "-t", apk.path])
+            if (code != 0) throw new GradleException("mirako: adb install of ${apk.name} on $device failed:\n$out")
+            println("mirako: installed ${apk.name} on $device")
+        }
+    }
+}
+
 // point Gradle at an empty stub project so the real build scripts are neither evaluated nor touched here
 def digest = MessageDigest.getInstance("SHA-1").digest(root.path.bytes).encodeHex().toString().substring(0, 12)
 def stub = new File(sp.gradleUserHomeDir, "mirako/stubs/$digest")
@@ -78,6 +122,7 @@ gradle.rootProject { p ->
         t.commandLine([bin, "run", "--project", projectRoot.path, "--", "./gradlew"] + gradleArgs)
         t.doNotTrackState("mirako is never up-to-date")
         t.notCompatibleWithConfigurationCache("a reused entry would replay the flags of an earlier invocation")
+        t.doLast { installs.each { adbInstall(it) } }
     }
 }
 "#;
@@ -206,6 +251,7 @@ mod tests {
             "containsKey(\"mirako.disabled\")",
             "excludedTaskNames.remove(\"mirako\")",
             "contains(\"mirako.enabled=false\")",
+            "!(it in installs) && it ==~ /(.*:)?((install|uninstall|connected)[A-Z]\\w*|deviceCheck)/",
             "it.commandLine(bin, \"check\", \"--project\", root.path)",
             "check.result.get().exitValue != 0",
             "sp.dryRun",
@@ -219,5 +265,14 @@ mod tests {
         assert!(INIT_SCRIPT.contains("p.tasks.register(\"mirako\", Exec)"));
         assert!(INIT_SCRIPT.contains("sp.setTaskNames([\"mirako\"])"));
         assert!(INIT_SCRIPT.contains("[bin, \"run\", \"--project\", projectRoot.path, \"--\", \"./gradlew\"]"));
+    }
+
+    #[test]
+    fn init_script_builds_an_install_task_remotely_and_installs_the_apk_here() {
+        // only a debug or release variant: `installDist`, `installGitHooks` are no Android installs
+        assert!(INIT_SCRIPT.contains("it ==~ /(.*:)?install([A-Z]\\w*)?(Debug|Release)(AndroidTest)?/"));
+        assert!(INIT_SCRIPT.contains("it.replaceFirst(/(^|:)install(?=[A-Z]\\w*$)/, '$1assemble')"));
+        assert!(INIT_SCRIPT.contains("t.doLast { installs.each { adbInstall(it) } }"));
+        assert!(INIT_SCRIPT.contains("[adb, \"-s\", device, \"install\", \"-r\", \"-t\", apk.path]"));
     }
 }

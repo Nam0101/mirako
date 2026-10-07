@@ -139,6 +139,10 @@ well: when the connection closes the agent sends SIGTERM to the command and ever
 started, and SIGKILL to what is left two seconds later at most. Two runs of one project never
 overlap: the second waits for the first.
 
+A transfer that takes more than a second reports on stderr how far it is
+(`push   42.0 MB of 95.4 MB, 12.1 MB/s`; a pull counts the bytes received): one line redrawn in
+place on a terminal, a line every five seconds anywhere else. `mirako run --quiet` leaves it out.
+
 ### Keeping the remote's disk in check
 
 Every project gets a copy under `remote_folder`, build outputs included, and it stays there
@@ -171,6 +175,16 @@ finishes.
 
 - one build locally: `./gradlew <task> -x mirako` (or `-Pmirako.disabled`)
 - `updateDaemonJvm` and `wrapper` (they edit the project's Gradle config) always run locally
+- `install<Variant>` of a debug or release variant (`installDebug`, `:app:installProductionDebug`,
+  `installDebugAndroidTest`) builds `assemble<Variant>` on the remote, then runs
+  `adb install -r -t` here with the pulled APK (the one `build/outputs/apk/**/output-metadata.json`
+  lists for that variant) on every attached device, or on the one `ANDROID_SERIAL` names. `adb`
+  is the one under `sdk.dir` of `local.properties`, else under `ANDROID_HOME`, else on the `PATH`.
+  A variant with several APKs (splits) fails with a message: build that one with `-x mirako`
+- a build with any other `install…` task, or an `uninstall…`, `connected…` or `deviceCheck` one,
+  runs locally: those talk to the device attached to this machine. Names are matched as typed,
+  so an abbreviation (`iD`) goes to the host as it is. (Run in Android Studio is none of these:
+  it assembles on the remote and deploys the pulled APK itself)
 - one project always local: `mirako.enabled=false` in its `local.properties`
 - host unreachable: the build simply runs locally. The script asks `mirako check` first (one
   handshake, ~0.1 s); `shim_check = false` in the global config skips that, and a dead host then

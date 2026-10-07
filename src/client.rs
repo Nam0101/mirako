@@ -4,6 +4,7 @@ use crate::config::Config;
 use crate::delta;
 use crate::index::{Index, Sigs};
 use crate::patterns::Matcher;
+use crate::progress::Progress;
 use crate::proto::{self, read_frame, write_frame, Chunk, DeltaChunk, Entry, GcReport, GcReq, Kind, Req, Resp, CHUNK};
 use crate::rewrite::LineRewriter;
 use crate::server::read_full;
@@ -39,6 +40,8 @@ pub struct Session {
     writer: BufWriter<std::process::ChildStdin>,
     pub remote_home: String,
     pub remote_os: String,
+    /// `--quiet`: no progress lines while a transfer runs
+    pub quiet: bool,
 }
 
 /// One try at `Session::connect`: up, or why the agent needs (re)installing first.
@@ -142,6 +145,7 @@ impl Session {
                     writer,
                     remote_home: home,
                     remote_os: os,
+                    quiet: false,
                 }))
             }
             Resp::Error { msg } => bail!("remote: {msg}"),
@@ -245,6 +249,7 @@ impl Session {
         if !to_delete.is_empty() {
             self.send(&Req::Delete { paths: to_delete })?;
         }
+        let mut progress = Progress::new("push", Some(to_send.iter().map(|e| e.size).sum()), !self.quiet);
         for e in &to_send {
             match &e.kind {
                 Kind::Symlink { target } => self.send(&Req::Symlink {
@@ -253,12 +258,12 @@ impl Session {
                 })?,
                 Kind::File => {
                     if let Some(bytes) = portable.get(&e.path) {
-                        stats.wire += self.send_from(e, bytes.as_slice())?;
+                        stats.wire += self.send_from(e, bytes.as_slice(), &mut progress)?;
                     } else if let Some(sig) = sigs.get(&e.path) {
-                        stats.wire += self.send_delta(root, e, sig)?;
+                        stats.wire += self.send_delta(root, e, sig, &mut progress)?;
                         stats.deltas += 1;
                     } else {
-                        stats.wire += self.send_file(root, e)?;
+                        stats.wire += self.send_file(root, e, &mut progress)?;
                     }
                     stats.bytes += e.size;
                 }
@@ -275,7 +280,7 @@ impl Session {
             let by_path: HashMap<&str, &Entry> = to_send.iter().map(|e| (e.path.as_str(), *e)).collect();
             for p in &failed {
                 if let Some(e) = by_path.get(p.as_str()) {
-                    stats.wire += self.send_file(root, e)?;
+                    stats.wire += self.send_file(root, e, &mut progress)?;
                 }
             }
             let again = self.flush_and(after)?;
@@ -286,14 +291,14 @@ impl Session {
         Ok(stats)
     }
 
-    fn send_file(&mut self, root: &Path, e: &Entry) -> Result<u64> {
+    fn send_file(&mut self, root: &Path, e: &Entry, progress: &mut Progress) -> Result<u64> {
         let full = root.join(&e.path);
         let f = fs::File::open(&full).with_context(|| format!("reading {}", full.display()))?;
-        self.send_from(e, f)
+        self.send_from(e, f, progress)
     }
 
     /// Streams `src`, the `e.size` bytes of `e`, as `Put` chunks. Returns the bytes on the wire.
-    fn send_from(&mut self, e: &Entry, mut src: impl Read) -> Result<u64> {
+    fn send_from(&mut self, e: &Entry, mut src: impl Read, progress: &mut Progress) -> Result<u64> {
         let mut offset = 0u64;
         let mut wire = 0u64;
         let mut buf = vec![0u8; CHUNK];
@@ -312,6 +317,7 @@ impl Session {
                 data,
             }))?;
             offset += n as u64;
+            progress.add(n as u64);
             if last {
                 break;
             }
@@ -320,7 +326,7 @@ impl Session {
     }
 
     /// `e.hash` comes from the scan that found the file changed, so the file is read once here.
-    fn send_delta(&mut self, root: &Path, e: &Entry, sig: &proto::Signature) -> Result<u64> {
+    fn send_delta(&mut self, root: &Path, e: &Entry, sig: &proto::Signature, progress: &mut Progress) -> Result<u64> {
         let data = fs::read(root.join(&e.path))?;
         let head = DeltaChunk {
             path: e.path.clone(),
@@ -332,7 +338,20 @@ impl Session {
             last: false,
         };
         let writer = &mut self.writer;
-        delta::stream(&data, sig, &head, |frame| write_frame(writer, &Req::Delta(frame)))
+        let mut covered = 0u64;
+        let wire = delta::stream(&data, sig, &head, |frame| {
+            // an estimate while the file is under way (a literal counts as its compressed bytes), exact at its end
+            let ops = frame.ops.iter().map(|o| match o {
+                proto::Op::Copy { count, .. } => *count as u64 * delta::BLOCK as u64,
+                proto::Op::Data(d) => d.len() as u64,
+            });
+            let n = ops.sum::<u64>().min(e.size - covered);
+            covered += n;
+            progress.add(n);
+            write_frame(writer, &Req::Delta(frame))
+        })?;
+        progress.add(e.size - covered);
+        Ok(wire)
     }
 
     /// Download: the `Pull` request went up while the command ran (see `run`), so the agent is
@@ -370,10 +389,12 @@ impl Session {
         let mut failed = Vec::new();
         // Windows: the links of the host, which this side does not make (see `xfer::make_symlink`)
         let mut no_link = Vec::new();
+        let mut progress = Progress::new("pull", None, !self.quiet);
         loop {
             match self.recv()? {
                 Resp::Put(chunk) => {
                     stats.wire += chunk.data.len() as u64;
+                    progress.add(chunk.data.len() as u64);
                     if let Some(f) = inbox.put(root, &chunk)? {
                         stats.files += 1;
                         stats.bytes += f.size;
@@ -381,11 +402,13 @@ impl Session {
                     }
                 }
                 Resp::Delta(chunk) => {
-                    stats.wire += chunk
+                    let wire = chunk
                         .ops
                         .iter()
                         .map(|o| if let proto::Op::Data(d) = o { d.len() as u64 } else { 8 })
                         .sum::<u64>();
+                    stats.wire += wire;
+                    progress.add(wire);
                     if let Some(f) = inbox.delta(root, &chunk, delta::BLOCK as u32)? {
                         if f.ok {
                             stats.files += 1;
@@ -406,6 +429,7 @@ impl Session {
                 other => bail!("unexpected reply {other:?}"),
             }
         }
+        drop(progress);
         if let Some(first) = no_link.first() {
             eprintln!(
                 "mirako: {} symlink(s) of the host not made here, Windows gets none (the first: {first}); `exclude_remote_extra` leaves them out",
@@ -620,6 +644,7 @@ pub fn run(root: &Path, cfg: &Config, cmd: &[String], opts: &RunOptions) -> Resu
         }
         Err(e) => return Err(e),
     };
+    session.quiet = opts.quiet;
     let say = |s: String| {
         if !opts.quiet {
             println!("{s}")

@@ -7,6 +7,7 @@ pub mod delta;
 pub mod gc;
 pub mod index;
 pub mod patterns;
+pub mod progress;
 pub mod proto;
 pub mod rewrite;
 pub mod server;
