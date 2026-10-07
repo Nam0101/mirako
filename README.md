@@ -99,6 +99,7 @@ Deploy-to-device works because the APK is pulled into `app/build/outputs` before
 finishes.
 
 - one build locally: `./gradlew <task> -x mirako` (or `-Pmirako.disabled`)
+- `updateDaemonJvm` and `wrapper` (they edit the project's Gradle config) always run locally
 - one project always local: `mirako.enabled=false` in its `local.properties`
 - host unreachable: the build simply runs locally
 - back to local builds for good: delete `~/.gradle/init.d/mirako.gradle`

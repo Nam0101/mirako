@@ -13,6 +13,7 @@ import java.security.MessageDigest
 
 def sp = gradle.startParameter
 if (sp.taskNames.isEmpty() || sp.dryRun) return
+if (sp.taskNames.any { it in ["updateDaemonJvm", ":updateDaemonJvm", "wrapper", ":wrapper"] }) return   // edits the project's gradle config: stays local
 if (sp.projectProperties.containsKey("mirako.disabled")) return
 if (sp.excludedTaskNames.remove("mirako")) return
 if (System.getenv("MIRAKO_REMOTE") == "1") return   // this is already the remote build
