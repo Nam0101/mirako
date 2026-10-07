@@ -1,9 +1,11 @@
 //! Receiving side of file transfers, shared by the client (pull) and the agent (push):
 //! whole-file chunks and delta chunks land in a temp file next to the destination and are
 //! renamed into place when complete, so a broken connection never leaves a half-written file.
+//! Nothing is fsync'ed: that costs ~4 ms per file on macOS and the next sync repairs whatever a
+//! power cut might lose.
 
 use crate::delta;
-use crate::proto::{Chunk, DeltaChunk};
+use crate::proto::{self, Chunk, DeltaChunk};
 use anyhow::{bail, Context, Result};
 use filetime::FileTime;
 use std::collections::HashMap;
@@ -73,7 +75,6 @@ impl Inbox {
         let Inbound {
             file, tmp, dest, hasher, ..
         } = self.open.remove(rel).unwrap();
-        file.sync_data().ok();
         let size = file.metadata()?.len();
         drop(file);
         let hash = *hasher.finalize().as_bytes();
@@ -107,7 +108,7 @@ impl Inbox {
         if c.offset == 0 {
             self.start(root, &c.path, false)?;
         }
-        let data = zstd::decode_all(&c.data[..])?;
+        let data = proto::decompress(&c.data)?;
         let inb = self
             .open
             .get_mut(&c.path)

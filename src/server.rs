@@ -4,7 +4,7 @@
 use crate::delta;
 use crate::index::{self, Index};
 use crate::patterns::Matcher;
-use crate::proto::{self, read_frame, write_frame, Chunk, DeltaChunk, Req, Resp, CHUNK, ZSTD_LEVEL};
+use crate::proto::{self, read_frame, write_frame, Chunk, DeltaChunk, Req, Resp, CHUNK};
 use crate::xfer::{safe_join, Inbox};
 use anyhow::{bail, Context, Result};
 use std::collections::HashMap;
@@ -25,6 +25,12 @@ fn send(out: &Out, resp: &Resp) -> Result<()> {
     Ok(())
 }
 
+/// A frame the client does not wait for (the pieces of a `Fetch`): leave it in the buffer so
+/// small files coalesce into fewer writes; `Resp::End` flushes.
+fn stream(out: &Out, resp: &Resp) -> Result<()> {
+    write_frame(&mut *out.lock().unwrap(), resp)
+}
+
 pub fn expand_home(p: &str) -> PathBuf {
     if let Some(rest) = p.strip_prefix("~/") {
         if let Some(home) = dirs::home_dir() {
@@ -40,6 +46,9 @@ pub fn serve() -> Result<()> {
     let mut inbox = Inbox::default();
     let mut index: Option<(PathBuf, Index)> = None;
     let mut failed_deltas: Vec<String> = Vec::new();
+    // an `Ack` reported failed deltas: the client resends them, so refuse to run anything until
+    // a clean `Flush` says the tree is whole again
+    let mut blocked = false;
 
     loop {
         let req: Req = match read_frame(&mut input) {
@@ -131,9 +140,15 @@ pub fn serve() -> Result<()> {
                     idx.save();
                 }
                 let failed = std::mem::take(&mut failed_deltas);
+                blocked = !failed.is_empty();
                 send(&out, &Resp::Ack { failed })
             }
-            Req::Exec { dir, cmd } => exec(&out, &expand_home(&dir), &cmd),
+            Req::Exec { dir, cmd } => {
+                if blocked {
+                    bail!("a delta push did not rebuild; waiting for the resend before running anything");
+                }
+                exec(&out, &expand_home(&dir), &cmd)
+            }
             Req::Fetch { dir, paths, sigs } => {
                 let root = expand_home(&dir).canonicalize()?;
                 let sigs: HashMap<String, _> = sigs.into_iter().collect();
@@ -142,7 +157,7 @@ pub fn serve() -> Result<()> {
                     let md = fs::symlink_metadata(&full)?;
                     if md.file_type().is_symlink() {
                         let target = fs::read_link(&full)?.to_string_lossy().into_owned();
-                        send(&out, &Resp::Symlink { path: p, target })?;
+                        stream(&out, &Resp::Symlink { path: p, target })?;
                     } else if let Some(sig) = sigs.get(&p).filter(|_| delta::delta_worthwhile(md.len())) {
                         send_delta(&out, &full, &p, &md, sig)?;
                     } else {
@@ -171,8 +186,8 @@ fn send_file(out: &Out, full: &Path, rel: &str, md: &fs::Metadata) -> Result<()>
     loop {
         let n = read_full(&mut f, &mut buf)?;
         let last = offset + n as u64 >= size || n == 0;
-        let data = zstd::encode_all(&buf[..n], ZSTD_LEVEL)?;
-        send(
+        let data = proto::compress(&buf[..n])?;
+        stream(
             out,
             &Resp::Put(Chunk {
                 path: rel.to_string(),
@@ -195,48 +210,17 @@ fn send_file(out: &Out, full: &Path, rel: &str, md: &fs::Metadata) -> Result<()>
 /// Stream one file as `Resp::Delta` chunks against the client's signature.
 fn send_delta(out: &Out, full: &Path, rel: &str, md: &fs::Metadata, sig: &proto::Signature) -> Result<()> {
     let data = fs::read(full)?;
-    let hash = *blake3::hash(&data).as_bytes();
-    let mode = md.permissions().mode() & 0o7777;
-    let mtime_ns = index::mtime_ns(md);
-    let size = data.len() as u64;
-    let mut ops = Vec::new();
-    let mut pending = 0usize;
-    delta::delta(&data, sig, |op| {
-        pending += match &op {
-            proto::Op::Data(d) => d.len(),
-            _ => 8,
-        };
-        ops.push(op);
-        if pending >= CHUNK {
-            let batch = std::mem::take(&mut ops);
-            pending = 0;
-            send(
-                out,
-                &Resp::Delta(DeltaChunk {
-                    path: rel.into(),
-                    mode,
-                    mtime_ns,
-                    size,
-                    hash,
-                    ops: batch,
-                    last: false,
-                }),
-            )?;
-        }
-        Ok(())
-    })?;
-    send(
-        out,
-        &Resp::Delta(DeltaChunk {
-            path: rel.into(),
-            mode,
-            mtime_ns,
-            size,
-            hash,
-            ops,
-            last: true,
-        }),
-    )
+    let head = DeltaChunk {
+        path: rel.into(),
+        mode: md.permissions().mode() & 0o7777,
+        mtime_ns: index::mtime_ns(md),
+        size: data.len() as u64,
+        hash: *blake3::hash(&data).as_bytes(),
+        ops: Vec::new(),
+        last: false,
+    };
+    delta::stream(&data, sig, &head, |frame| stream(out, &Resp::Delta(frame)))?;
+    Ok(())
 }
 
 pub fn read_full<R: Read>(r: &mut R, buf: &mut [u8]) -> io::Result<usize> {

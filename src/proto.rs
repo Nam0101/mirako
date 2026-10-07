@@ -6,6 +6,7 @@
 
 use anyhow::{bail, Context, Result};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use std::cell::RefCell;
 use std::io::{Read, Write};
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -41,6 +42,7 @@ pub struct Chunk {
     pub offset: u64,
     pub last: bool,
     /// zstd-compressed bytes
+    #[serde(with = "serde_bytes")]
     pub data: Vec<u8>,
 }
 
@@ -58,7 +60,7 @@ pub enum Op {
     /// `count` consecutive blocks of the old file starting at `index`
     Copy { index: u32, count: u32 },
     /// zstd-compressed literal bytes
-    Data(Vec<u8>),
+    Data(#[serde(with = "serde_bytes")] Vec<u8>),
 }
 
 /// A piece of a delta transfer. The receiver rebuilds the file from its old copy + ops.
@@ -131,6 +133,7 @@ pub enum Resp {
     Sigs(Vec<(String, Signature)>),
     Output {
         stderr: bool,
+        #[serde(with = "serde_bytes")]
         data: Vec<u8>,
     },
     Exit {
@@ -146,6 +149,27 @@ pub enum Resp {
     Error {
         msg: String,
     },
+}
+
+thread_local! {
+    static COMPRESSOR: RefCell<zstd::bulk::Compressor<'static>> = RefCell::new(zstd::bulk::Compressor::new(ZSTD_LEVEL).expect("zstd"));
+    static DECOMPRESSOR: RefCell<zstd::bulk::Decompressor<'static>> = RefCell::new(zstd::bulk::Decompressor::new().expect("zstd"));
+}
+
+/// zstd with a per-thread context kept across calls: `encode_all` would allocate a fresh one
+/// per chunk, which costs more than compressing a small file.
+pub fn compress(data: &[u8]) -> Result<Vec<u8>> {
+    Ok(COMPRESSOR.with(|c| c.borrow_mut().compress(data))?)
+}
+
+pub fn decompress(z: &[u8]) -> Result<Vec<u8>> {
+    match zstd::zstd_safe::get_frame_content_size(z) {
+        // nothing legitimately decompresses past one chunk plus one delta block
+        Ok(Some(n)) if n > 2 * CHUNK as u64 => bail!("zstd frame of {n} bytes exceeds the chunk limit"),
+        Ok(Some(n)) => Ok(DECOMPRESSOR.with(|d| d.borrow_mut().decompress(z, n as usize))?),
+        // frames from a streaming encoder carry no size: fall back to the streaming decoder
+        _ => Ok(zstd::decode_all(z)?),
+    }
 }
 
 pub fn write_frame<W: Write, T: Serialize>(w: &mut W, msg: &T) -> Result<()> {

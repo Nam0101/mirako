@@ -8,7 +8,6 @@ use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
-use std::io;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
@@ -170,8 +169,7 @@ pub fn mtime_ns(md: &fs::Metadata) -> i64 {
 }
 
 pub fn hash_file(path: &Path) -> Result<[u8; 32]> {
-    let mut f = fs::File::open(path)?;
     let mut h = blake3::Hasher::new();
-    io::copy(&mut f, &mut h)?;
+    h.update_reader(fs::File::open(path)?)?;
     Ok(*h.finalize().as_bytes())
 }

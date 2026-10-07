@@ -1,6 +1,6 @@
 [package]
 name = "mirako"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Remote builds: sync the project to another machine over ssh (content-hash delta, zstd), run the command there, pull the outputs back."
 license = "MIT"
@@ -19,6 +19,7 @@ filetime = "0.2"
 globset = "0.4"
 rayon = "1"
 serde = { version = "1", features = ["derive"] }
+serde_bytes = "0.11"
 toml = "0.8"
 walkdir = "2"
 zstd = "0.13"

@@ -3,7 +3,8 @@
 //! window it recognises and literal bytes for the rest. An APK rebuilt after a one-line change
 //! shares most of its stored entries with the previous one, so a 90 MB file travels as a few MB.
 
-use crate::proto::{Op, Signature, CHUNK, ZSTD_LEVEL};
+use crate::proto::{self, DeltaChunk, Op, Signature, CHUNK};
+use crate::server::read_full;
 use anyhow::Result;
 use std::collections::HashMap;
 use std::fs;
@@ -38,20 +39,35 @@ fn strong(data: &[u8]) -> [u8; 16] {
     out
 }
 
+/// Streams the file one block at a time, so a 1 GB output costs 64 KB of memory, not 1 GB.
 pub fn signature(path: &Path) -> Result<Signature> {
-    let data = fs::read(path)?;
-    let blocks = data
-        .chunks(BLOCK)
-        .map(|c| {
-            let (a, b) = weak(c);
-            (a | (b << 16), strong(c))
-        })
-        .collect();
+    let mut f = fs::File::open(path)?;
+    let mut buf = vec![0u8; BLOCK];
+    let mut blocks = Vec::new();
+    let mut size = 0u64;
+    loop {
+        let n = read_full(&mut f, &mut buf)?;
+        if n == 0 {
+            break;
+        }
+        let (a, b) = weak(&buf[..n]);
+        blocks.push((a | (b << 16), strong(&buf[..n])));
+        size += n as u64;
+    }
     Ok(Signature {
         block: BLOCK as u32,
-        size: data.len() as u64,
+        size,
         blocks,
     })
+}
+
+/// A 2^20-bit filter over the weak checksums: the per-byte rolling loop tests one bit here and
+/// only touches the hash map on a hit, so unmatched data costs a few ns per byte, not a SipHash.
+const FILTER_BITS: u32 = 20;
+
+fn filter_slot(w: u32) -> (usize, u64) {
+    let h = w.wrapping_mul(0x9E37_79B1) >> (32 - FILTER_BITS);
+    ((h >> 6) as usize, 1u64 << (h & 63))
 }
 
 /// Emits ops describing `new` in terms of `sig`. Literal runs are zstd-compressed in pieces of
@@ -60,18 +76,21 @@ pub fn delta(new: &[u8], sig: &Signature, mut emit: impl FnMut(Op) -> Result<()>
     let b = sig.block as usize;
     let n = new.len();
     let mut lookup: HashMap<u32, Vec<u32>> = HashMap::new();
+    let mut filter = vec![0u64; 1 << (FILTER_BITS - 6)];
     for (i, (w, _)) in sig.blocks.iter().enumerate() {
         // the last block may be partial; a full window can never equal it
         if i + 1 == sig.blocks.len() && sig.size as usize % b != 0 {
             break;
         }
         lookup.entry(*w).or_default().push(i as u32);
+        let (slot, bit) = filter_slot(*w);
+        filter[slot] |= bit;
     }
 
     let mut literal: Vec<u8> = Vec::new();
     let flush_literal = |literal: &mut Vec<u8>, emit: &mut dyn FnMut(Op) -> Result<()>| -> Result<()> {
         if !literal.is_empty() {
-            emit(Op::Data(zstd::encode_all(&literal[..], ZSTD_LEVEL)?))?;
+            emit(Op::Data(proto::compress(literal)?))?;
             literal.clear();
         }
         Ok(())
@@ -85,8 +104,9 @@ pub fn delta(new: &[u8], sig: &Signature, mut emit: impl FnMut(Op) -> Result<()>
     };
 
     if n < b || lookup.is_empty() {
-        literal.extend_from_slice(new);
-        flush_literal(&mut literal, &mut emit)?;
+        for piece in new.chunks(CHUNK) {
+            emit(Op::Data(proto::compress(piece)?))?;
+        }
         return Ok(());
     }
 
@@ -94,10 +114,13 @@ pub fn delta(new: &[u8], sig: &Signature, mut emit: impl FnMut(Op) -> Result<()>
     let (mut a, mut bb) = weak(&new[0..b]);
     while i + b <= n {
         let w = a | (bb << 16);
+        let (slot, bit) = filter_slot(w);
         let mut matched = None;
-        if let Some(cands) = lookup.get(&w) {
-            let s = strong(&new[i..i + b]);
-            matched = cands.iter().copied().find(|&idx| sig.blocks[idx as usize].1 == s);
+        if filter[slot] & bit != 0 {
+            if let Some(cands) = lookup.get(&w) {
+                let s = strong(&new[i..i + b]);
+                matched = cands.iter().copied().find(|&idx| sig.blocks[idx as usize].1 == s);
+            }
         }
         if let Some(idx) = matched {
             flush_literal(&mut literal, &mut emit)?;
@@ -136,6 +159,39 @@ pub fn delta(new: &[u8], sig: &Signature, mut emit: impl FnMut(Op) -> Result<()>
     Ok(())
 }
 
+/// Runs `delta` and packs the ops into `DeltaChunk` frames of about `CHUNK` bytes, handing each
+/// to `emit` as soon as it is full so the transfer overlaps the rolling. Returns the bytes on the wire.
+pub fn stream(new: &[u8], sig: &Signature, head: &DeltaChunk, mut emit: impl FnMut(DeltaChunk) -> Result<()>) -> Result<u64> {
+    let frame = |ops: Vec<Op>, last: bool| DeltaChunk {
+        path: head.path.clone(),
+        mode: head.mode,
+        mtime_ns: head.mtime_ns,
+        size: head.size,
+        hash: head.hash,
+        ops,
+        last,
+    };
+    let mut ops = Vec::new();
+    let mut pending = 0usize;
+    let mut wire = 0u64;
+    delta(new, sig, |op| {
+        let n = match &op {
+            Op::Data(d) => d.len(),
+            Op::Copy { .. } => 8,
+        };
+        pending += n;
+        wire += n as u64;
+        ops.push(op);
+        if pending >= CHUNK {
+            emit(frame(std::mem::take(&mut ops), false))?;
+            pending = 0;
+        }
+        Ok(())
+    })?;
+    emit(frame(ops, true))?;
+    Ok(wire)
+}
+
 /// Rebuilds a file from `old` + `ops` into `out`, feeding every byte through `hasher`.
 pub fn apply(
     old: Option<&mut fs::File>,
@@ -154,18 +210,21 @@ pub fn apply(
                 let Some(old) = old.as_deref_mut() else {
                     anyhow::bail!("delta copy without an old file")
                 };
-                for k in 0..*count as u64 {
-                    let start = (*index as u64 + k) * b;
-                    let len = b.min(old_size.saturating_sub(start));
-                    buf.resize(len as usize, 0);
-                    old.seek(SeekFrom::Start(start))?;
+                // a run of blocks is one contiguous range of the old file: read it in big pieces
+                let start = *index as u64 * b;
+                let mut left = (start + *count as u64 * b).min(old_size).saturating_sub(start);
+                old.seek(SeekFrom::Start(start))?;
+                while left > 0 {
+                    let len = left.min(CHUNK as u64) as usize;
+                    buf.resize(len, 0);
                     old.read_exact(&mut buf)?;
                     hasher.update(&buf);
                     out.write_all(&buf)?;
+                    left -= len as u64;
                 }
             }
             Op::Data(z) => {
-                let data = zstd::decode_all(&z[..])?;
+                let data = proto::decompress(z)?;
                 hasher.update(&data);
                 out.write_all(&data)?;
             }
