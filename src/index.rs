@@ -53,7 +53,7 @@ impl Index {
                 return true;
             }
             let rel = rel_path(root, e.path());
-            !exclude.excluded(&rel)
+            !exclude.skip_subtree(&rel)
         });
         for e in walker {
             let e = match e {
@@ -67,6 +67,9 @@ impl Index {
                 continue;
             }
             let rel = rel_path(root, e.path());
+            if exclude.excluded(&rel) {
+                continue; // an excluded parent on the way to a `!include`
+            }
             let ft = e.file_type();
             if ft.is_symlink() {
                 let target = fs::read_link(e.path())?.to_string_lossy().into_owned();

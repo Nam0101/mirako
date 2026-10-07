@@ -1,6 +1,6 @@
 [package]
 name = "mirako"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 description = "Remote builds: sync the project to another machine over ssh (content-hash delta, zstd), run the command there, pull the outputs back."
 license = "MIT"

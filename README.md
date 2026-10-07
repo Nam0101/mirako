@@ -62,12 +62,13 @@ A `mirako.toml` next to `gradlew` overrides any of these per project (`mirako in
 sample). The `*_extra` keys append instead of replacing:
 
 ```toml
-exclude_remote_extra = ["build/intermediates", "build/tmp", "build/kotlin", "build/kspCaches"]
+exclude_remote_extra = ["build/intermediates", "!build/intermediates/apk_ide_redirect_file", "build/tmp", "build/kotlin", "build/kspCaches"]
 ```
 
 Patterns are rsync-like: `build` matches at any depth, `build/intermediates` matches that
 relative path at any depth, `/local.properties` is anchored at the project root, `*.log` is a
-glob that never crosses `/`.
+glob that never crosses `/`. A `!pattern` keeps that path even if an earlier pattern excludes
+it (Android Studio needs `apk_ide_redirect_file` to find the APK after a build).
 
 - `exclude_local`: not uploaded (your local build outputs)
 - `exclude_remote`: not downloaded (sources on the remote)

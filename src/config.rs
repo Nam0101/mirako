@@ -156,8 +156,9 @@ pub const SAMPLE_PROJECT_TOML: &str = r#"# mirako.toml — per-project settings 
 # remote_folder = "~/mirako"
 # fallback = true
 
-# Android: the IDE only needs build/outputs (and build/generated for navigation)
-exclude_remote_extra = ["build/intermediates", "build/tmp", "build/kotlin", "build/kspCaches"]
+# Android: the IDE only needs build/outputs, build/generated (navigation) and the
+# apk_ide_redirect_file that tells Android Studio where the APK is
+exclude_remote_extra = ["build/intermediates", "!build/intermediates/apk_ide_redirect_file", "build/tmp", "build/kotlin", "build/kspCaches"]
 "#;
 
 pub const SAMPLE_GLOBAL_TOML: &str = r#"# ~/.config/mirako/config.toml
