@@ -30,7 +30,7 @@ fn benches(c: &mut Criterion) {
 
     let mut g = c.benchmark_group("delta");
     g.sample_size(10)
-        .measurement_time(Duration::from_secs(3))
+        .measurement_time(Duration::from_secs(2))
         .warm_up_time(Duration::from_secs(1));
     g.throughput(Throughput::Bytes(SIZE as u64));
 

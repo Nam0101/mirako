@@ -207,7 +207,11 @@ fn cold_run_pushes_sources_runs_the_command_and_pulls_outputs() {
 
     let out = p.run_ok(
         &[],
-        &["sh", "-c", "mkdir -p build/outputs && cat src/a.txt src/sub/b.txt > build/outputs/out.txt && echo \"built in $PWD\""],
+        &[
+            "sh",
+            "-c",
+            "mkdir -p build/outputs && cat src/a.txt src/sub/b.txt > build/outputs/out.txt && echo \"built in $PWD\"",
+        ],
     );
     assert!(out.contains(&format!("built in {}\n", p.root.display())), "{out}");
     assert!(!out.contains(p.remote.to_str().unwrap()), "remote path not rewritten:\n{out}");
@@ -279,7 +283,10 @@ fn big_changed_file_goes_as_a_delta() {
     let out = p.run_ok(&[], &["true"]);
     let (files, deltas, wire) = counts(line(&out, "push"));
     assert_eq!((files, deltas), (1, 1), "{out}");
-    assert!(wire.ends_with(" KB") || wire.ends_with(" B"), "wire {wire} is not under 1 MB:\n{out}");
+    assert!(
+        wire.ends_with(" KB") || wire.ends_with(" B"),
+        "wire {wire} is not under 1 MB:\n{out}"
+    );
     if let Some(kb) = wire.strip_suffix(" KB") {
         assert!(kb.parse::<u64>().unwrap() < 500, "{out}");
     }
@@ -320,7 +327,10 @@ fn no_push_and_no_pull_flags() {
     assert_eq!(read(&p.remote.join("src/a.txt")), b"v1", "--no-push uploaded");
     assert_eq!(read(&p.root.join("build/seen.txt")), b"v1");
 
-    let out = p.run_ok(&["--no-pull"], &["sh", "-c", "cp src/a.txt build/seen.txt && echo x > build/new.txt"]);
+    let out = p.run_ok(
+        &["--no-pull"],
+        &["sh", "-c", "cp src/a.txt build/seen.txt && echo x > build/new.txt"],
+    );
     assert!(!out.lines().any(|l| l.starts_with("pull")), "{out}");
     assert_eq!(read(&p.remote.join("src/a.txt")), b"v2");
     assert_eq!(read(&p.root.join("build/seen.txt")), b"v1", "--no-pull downloaded");

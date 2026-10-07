@@ -5,6 +5,7 @@ use criterion::{criterion_group, criterion_main, Criterion, Throughput};
 use mirako::config::{DEFAULT_EXCLUDE_COMMON, DEFAULT_EXCLUDE_LOCAL, DEFAULT_EXCLUDE_REMOTE};
 use mirako::patterns::Matcher;
 use std::hint::black_box;
+use std::time::Duration;
 
 const SAMPLE_REMOTE_EXTRA: &[&str] = &[
     "build/intermediates",
@@ -46,6 +47,7 @@ fn benches(c: &mut Criterion) {
     let paths = paths(10_000);
 
     let mut g = c.benchmark_group("patterns");
+    g.measurement_time(Duration::from_secs(2)).warm_up_time(Duration::from_secs(1));
     g.bench_function("new/remote_with_includes", |b| {
         b.iter(|| Matcher::new(black_box(&patterns)).unwrap())
     });

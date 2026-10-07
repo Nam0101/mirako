@@ -3,6 +3,7 @@
 use criterion::{criterion_group, criterion_main, Criterion, Throughput};
 use mirako::rewrite::LineRewriter;
 use std::hint::black_box;
+use std::time::Duration;
 
 const REMOTE: &str = "/Users/builder/mirako/my-android-app";
 const LOCAL: &str = "/Users/dev/AndroidStudioProjects/my-android-app";
@@ -35,6 +36,7 @@ fn log(len: usize) -> Vec<u8> {
 fn benches(c: &mut Criterion) {
     let data = log(4 << 20);
     let mut g = c.benchmark_group("rewrite");
+    g.measurement_time(Duration::from_secs(2)).warm_up_time(Duration::from_secs(1));
     g.sample_size(20);
     g.throughput(Throughput::Bytes(data.len() as u64));
     g.bench_function("feed_32k_chunks", |b| {

@@ -12,7 +12,7 @@ use std::time::Duration;
 fn zstd(c: &mut Criterion) {
     let mut g = c.benchmark_group("zstd");
     g.sample_size(20)
-        .measurement_time(Duration::from_secs(3))
+        .measurement_time(Duration::from_secs(2))
         .warm_up_time(Duration::from_secs(1));
     g.throughput(Throughput::Bytes(CHUNK as u64));
     for (name, data) in [("compressible", compressible(CHUNK, 1)), ("noise", noise(CHUNK, 1))] {
@@ -30,7 +30,7 @@ fn zstd(c: &mut Criterion) {
 fn frames(c: &mut Criterion) {
     let mut g = c.benchmark_group("frame");
     g.sample_size(20)
-        .measurement_time(Duration::from_secs(3))
+        .measurement_time(Duration::from_secs(2))
         .warm_up_time(Duration::from_secs(1));
 
     const N: usize = 5000;
