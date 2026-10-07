@@ -16,6 +16,10 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::Instant;
 
+/// Non-interactive, and give up fast when the host is asleep or off the network so the
+/// Gradle shim falls back to a local build instead of hanging on the TCP timeout.
+const SSH_OPTS: &[&str] = &["-o", "BatchMode=yes", "-o", "ConnectTimeout=8"];
+
 pub struct Session {
     child: Child,
     reader: BufReader<std::process::ChildStdout>,
@@ -37,8 +41,7 @@ impl Session {
     pub fn connect(cfg: &Config) -> Result<Self> {
         let mut cmd = Command::new(&cfg.ssh[0]);
         cmd.args(&cfg.ssh[1..])
-            .arg("-o")
-            .arg("BatchMode=yes")
+            .args(SSH_OPTS)
             .arg(&cfg.host)
             .arg(format!("{} serve", cfg.remote_bin));
         let mut child = cmd
@@ -509,8 +512,10 @@ pub fn run(root: &Path, cfg: &Config, cmd: &[String], opts: &RunOptions) -> Resu
 }
 
 pub fn run_local(root: &Path, cmd: &[String]) -> Result<i32> {
+    // tell the Gradle shim not to try the remote again
     let status = Command::new(&cmd[0])
         .args(&cmd[1..])
+        .env("MIRAKO_LOCAL", "1")
         .current_dir(root)
         .status()
         .with_context(|| format!("running {}", cmd[0]))?;
@@ -532,8 +537,7 @@ pub fn remote_install(cfg: &Config) -> Result<()> {
         let out = match host {
             Some(h) => Command::new(&cfg.ssh[0])
                 .args(&cfg.ssh[1..])
-                .arg("-o")
-                .arg("BatchMode=yes")
+                .args(SSH_OPTS)
                 .arg(h)
                 .arg("uname -sm")
                 .output()?,
@@ -556,8 +560,7 @@ pub fn remote_install(cfg: &Config) -> Result<()> {
         format!("mkdir -p \"$(dirname {dest})\" && cat > {dest}.tmp && chmod +x {dest}.tmp && mv {dest}.tmp {dest} && {dest} --version");
     let mut child = Command::new(&cfg.ssh[0])
         .args(&cfg.ssh[1..])
-        .arg("-o")
-        .arg("BatchMode=yes")
+        .args(SSH_OPTS)
         .arg(&cfg.host)
         .arg(script)
         .stdin(Stdio::piped())

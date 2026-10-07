@@ -16,6 +16,7 @@ if (sp.taskNames.isEmpty() || sp.dryRun) return
 if (sp.projectProperties.containsKey("mirako.disabled")) return
 if (sp.excludedTaskNames.remove("mirako")) return
 if (System.getenv("MIRAKO_REMOTE") == "1") return   // this is already the remote build
+if (System.getenv("MIRAKO_LOCAL") == "1") return    // mirako already fell back to a local build
 
 def root = sp.currentDir
 while (root != null && !new File(root, "gradlew").exists()) root = root.parentFile
