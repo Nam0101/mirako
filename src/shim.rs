@@ -29,9 +29,12 @@ def bin = System.getenv("MIRAKO_BIN") ?: "__BIN__"
 if (!new File(bin).canExecute()) { println("mirako: binary not found at $bin, building locally"); return }
 
 // fast handshake; when the host is down the build simply stays local and untouched
-def check = [bin, "check", "--project", root.path].execute()
-check.waitFor()
-if (check.exitValue() != 0) { println("mirako: ${check.err.text.trim()} — building locally"); return }
+// (through ProviderFactory: the configuration cache rejects a plain execute() here, and re-runs this one before reusing an entry)
+def check = gradle.services.get(org.gradle.api.provider.ProviderFactory).exec {
+    it.commandLine(bin, "check", "--project", root.path)
+    it.ignoreExitValue = true
+}
+if (check.result.get().exitValue != 0) { println("mirako: ${check.standardError.asText.get().trim()} — building locally"); return }
 
 // reconstruct the invocation for the remote ./gradlew
 def args = []
@@ -77,6 +80,7 @@ gradle.rootProject { p ->
         t.workingDir = projectRoot
         t.commandLine([bin, "run", "--project", projectRoot.path, "--", "./gradlew"] + gradleArgs)
         t.doNotTrackState("mirako is never up-to-date")
+        t.notCompatibleWithConfigurationCache("a reused entry would replay the flags of an earlier invocation")
     }
 }
 "#;
@@ -118,8 +122,8 @@ mod tests {
             "containsKey(\"mirako.disabled\")",
             "excludedTaskNames.remove(\"mirako\")",
             "contains(\"mirako.enabled=false\")",
-            "[bin, \"check\", \"--project\", root.path]",
-            "check.exitValue() != 0",
+            "it.commandLine(bin, \"check\", \"--project\", root.path)",
+            "check.result.get().exitValue != 0",
             "sp.dryRun",
         ] {
             assert!(INIT_SCRIPT.contains(marker), "missing {marker}");
