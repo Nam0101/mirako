@@ -20,6 +20,8 @@ pub struct FileConfig {
     pub exclude_local_extra: Option<Vec<String>>,
     pub exclude_remote_extra: Option<Vec<String>>,
     pub exclude_common_extra: Option<Vec<String>>,
+    pub gc_days: Option<u32>,
+    pub gc_after_pull: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone)]
@@ -32,6 +34,10 @@ pub struct Config {
     pub exclude_local: Vec<String>,
     pub exclude_remote: Vec<String>,
     pub exclude_common: Vec<String>,
+    /// a project's copy on the remote unused for this long is removed after a run; 0 = never
+    pub gc_days: u32,
+    /// deleted on the remote after every pull (rsync-like patterns)
+    pub gc_after_pull: Vec<String>,
 }
 
 pub const DEFAULT_EXCLUDE_LOCAL: &[&str] = &["build"];
@@ -110,6 +116,8 @@ impl Config {
                 g.exclude_common_extra.clone(),
                 p.exclude_common_extra.clone(),
             ),
+            gc_days: p.gc_days.or(g.gc_days).unwrap_or(7),
+            gc_after_pull: p.gc_after_pull.clone().or(g.gc_after_pull.clone()).unwrap_or_default(),
         })
     }
 
@@ -156,9 +164,12 @@ pub const SAMPLE_PROJECT_TOML: &str = r#"# mirako.toml — per-project settings 
 # remote_folder = "~/mirako"
 # fallback = true
 
-# Android: the IDE only needs build/outputs, build/generated (navigation) and the
-# apk_ide_redirect_file that tells Android Studio where the APK is
-exclude_remote_extra = ["build/intermediates", "!build/intermediates/apk_ide_redirect_file", "build/tmp", "build/kotlin", "build/kspCaches"]
+# Android: the IDE needs build/outputs, build/generated (navigation) and, to deploy, the
+# apk_ide_redirect_file plus the build/intermediates/apk it points at
+exclude_remote_extra = ["build/intermediates", "!build/intermediates/apk_ide_redirect_file", "!build/intermediates/apk", "build/tmp", "build/kotlin", "build/kspCaches"]
+
+# Free the remote's disk after every pull at the price of a clean build next time:
+# gc_after_pull = ["build/intermediates", "build/tmp", "build/kotlin", "build/kspCaches"]
 "#;
 
 pub const SAMPLE_GLOBAL_TOML: &str = r#"# ~/.config/mirako/config.toml
@@ -166,6 +177,8 @@ host = "m4"                      # ssh host or ~/.ssh/config alias
 remote_folder = "~/mirako"       # one sub-folder per project on the remote
 remote_bin = "~/.local/bin/mirako"
 fallback = true                  # run locally when the host is unreachable
+gc_days = 7                      # remove a project's remote copy unused for this long (Gradle's caches there too); 0 = never
+# gc_after_pull = ["build/intermediates", "build/tmp"]   # deleted on the remote after every pull: saves disk, costs a clean build next time
 # ssh = ["ssh", "-o", "BatchMode=yes"]
 # exclude_local  = ["build"]
 # exclude_remote = ["src"]

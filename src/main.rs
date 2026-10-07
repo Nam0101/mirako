@@ -1,6 +1,7 @@
 mod client;
 mod config;
 mod delta;
+mod gc;
 mod index;
 mod patterns;
 mod proto;
@@ -79,6 +80,19 @@ enum Cmd {
         /// write ~/.config/mirako/config.toml
         #[arg(long)]
         global: bool,
+    },
+    /// remove project copies unused for `gc_days` on the remote, list the rest
+    Gc {
+        #[arg(long, short)]
+        project: Option<PathBuf>,
+        #[arg(long)]
+        host: Option<String>,
+        /// remove copies not synced for more than this many days (0: every one); default `gc_days`
+        #[arg(long)]
+        days: Option<u32>,
+        /// list only
+        #[arg(long)]
+        dry_run: bool,
     },
     /// the Gradle init script for Android Studio / ./gradlew
     GradleShim {
@@ -218,6 +232,18 @@ fn real_main() -> Result<i32> {
                     println!("wrote {}", p.display());
                 }
             }
+            Ok(0)
+        }
+        Some(Cmd::Gc {
+            project,
+            host,
+            days,
+            dry_run,
+        }) => {
+            // works outside a project too: the global config alone names the host
+            let root = client::project_root_for(project.as_ref()).unwrap_or_else(|_| PathBuf::from("."));
+            let cfg = Config::load(&root, host.as_deref())?;
+            client::gc(&cfg, days, dry_run)?;
             Ok(0)
         }
         Some(Cmd::GradleShim { what }) => {

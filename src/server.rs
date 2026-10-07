@@ -2,6 +2,7 @@
 //! logs to stderr only.
 
 use crate::delta;
+use crate::gc;
 use crate::index::{self, Index};
 use crate::patterns::Matcher;
 use crate::proto::{self, read_frame, write_frame, Chunk, DeltaChunk, Req, Resp, CHUNK};
@@ -166,6 +167,7 @@ pub fn serve() -> Result<()> {
                 }
                 send(&out, &Resp::End)
             }
+            Req::Gc(req) => send(&out, &Resp::Gc(gc::collect(&req)?)),
             Req::Bye => std::process::exit(0),
         })();
         if let Err(e) = result {

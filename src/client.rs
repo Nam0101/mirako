@@ -4,7 +4,7 @@ use crate::config::Config;
 use crate::delta;
 use crate::index::Index;
 use crate::patterns::Matcher;
-use crate::proto::{self, read_frame, write_frame, Chunk, DeltaChunk, Entry, Kind, Req, Resp, CHUNK};
+use crate::proto::{self, read_frame, write_frame, Chunk, DeltaChunk, Entry, GcReport, GcReq, Kind, Req, Resp, CHUNK};
 use crate::rewrite::LineRewriter;
 use crate::server::read_full;
 use crate::xfer::Inbox;
@@ -406,6 +406,13 @@ impl Session {
         Ok(failed)
     }
 
+    pub fn gc(&mut self, req: GcReq) -> Result<GcReport> {
+        match self.call(&Req::Gc(req))? {
+            Resp::Gc(r) => Ok(r),
+            other => bail!("unexpected reply {other:?}"),
+        }
+    }
+
     pub fn close(mut self) {
         let _ = self.send(&Req::Bye);
         let _ = self.writer.flush();
@@ -420,7 +427,9 @@ pub struct RunOptions {
 }
 
 fn human(bytes: u64) -> String {
-    if bytes >= 1 << 20 {
+    if bytes >= 1 << 30 {
+        format!("{:.1} GB", bytes as f64 / (1u64 << 30) as f64)
+    } else if bytes >= 1 << 20 {
         format!("{:.1} MB", bytes as f64 / (1u64 << 20) as f64)
     } else if bytes >= 1 << 10 {
         format!("{:.0} KB", bytes as f64 / 1024.0)
@@ -524,9 +533,84 @@ pub fn run(root: &Path, cfg: &Config, cmd: &[String], opts: &RunOptions) -> Resu
             secs(t)
         ));
     }
+
+    // housekeeping on the host: stale mirrors, intermediates the client never downloads (only
+    // once they are not needed any more, i.e. after a pull), Gradle's retention. Never fails a build.
+    if cfg.gc_days > 0 || (opts.pull && !cfg.gc_after_pull.is_empty()) {
+        let req = GcReq {
+            folder: cfg.remote_folder.clone(),
+            keep_days: (cfg.gc_days > 0).then_some(cfg.gc_days),
+            current: Some(remote_dir.clone()),
+            build: if opts.pull { cfg.gc_after_pull.clone() } else { Vec::new() },
+            gradle_days: cfg.gc_days,
+            dry_run: false,
+            sizes: false,
+        };
+        match session.gc(req) {
+            Ok(r) => {
+                let mut parts: Vec<String> = r
+                    .mirrors
+                    .iter()
+                    .filter(|m| m.removed)
+                    .map(|m| format!("{} removed ({}, unused {} d)", m.name, human(m.bytes), m.idle_days.unwrap_or(0)))
+                    .collect();
+                if r.build_bytes > 0 {
+                    parts.push(format!("{} of intermediates deleted", human(r.build_bytes)));
+                }
+                if !parts.is_empty() {
+                    parts.push(format!("{} free", human(r.free)));
+                    say(format!("gc     {}", parts.join(", ")));
+                }
+            }
+            Err(e) => eprintln!("mirako: gc: {e:#}"),
+        }
+    }
     session.close();
     say(format!("total  {}", secs(start)));
     Ok(code)
+}
+
+/// `mirako gc`: list the project copies on the host and remove the stale ones.
+pub fn gc(cfg: &Config, days: Option<u32>, dry_run: bool) -> Result<()> {
+    let keep = days.or((cfg.gc_days > 0).then_some(cfg.gc_days));
+    let mut session = Session::connect(cfg)?;
+    let r = session.gc(GcReq {
+        folder: cfg.remote_folder.clone(),
+        keep_days: keep,
+        current: None,
+        build: Vec::new(),
+        gradle_days: cfg.gc_days,
+        dry_run,
+        sizes: true,
+    })?;
+    session.close();
+    let rule = match keep {
+        Some(d) => format!("removing copies unused for more than {d} days"),
+        None => "gc_days = 0, listing only".into(),
+    };
+    println!("mirako {}: {} on {}, {rule}", proto::VERSION, cfg.remote_folder, cfg.host);
+    let width = r.mirrors.iter().map(|m| m.name.len()).max().unwrap_or(0);
+    for m in &r.mirrors {
+        let (size, state) = match (m.idle_days, m.removed) {
+            (None, _) => ("-".to_string(), "not synced by mirako, left alone".to_string()),
+            (Some(d), true) if dry_run => (human(m.bytes), format!("unused {d} d, would be removed")),
+            (Some(d), true) => (human(m.bytes), format!("unused {d} d, removed")),
+            (Some(0), false) => (human(m.bytes), "used today".to_string()),
+            (Some(d), false) => (human(m.bytes), format!("unused {d} d")),
+        };
+        println!("  {:<width$}  {size:>9}  {state}", m.name);
+    }
+    if r.mirrors.is_empty() {
+        println!("  nothing under {}", cfg.remote_folder);
+    }
+    if cfg.gc_days > 0 && !dry_run {
+        println!(
+            "gradle  entries unused for {} days are removed by Gradle itself (~/.gradle/init.d/mirako-gc.gradle)",
+            cfg.gc_days
+        );
+    }
+    println!("free    {}", human(r.free));
+    Ok(())
 }
 
 pub fn run_local(root: &Path, cmd: &[String]) -> Result<i32> {

@@ -52,6 +52,8 @@ host = "m4"                      # ssh host or ~/.ssh/config alias
 remote_folder = "~/mirako"       # one sub-folder per project on the remote
 remote_bin = "~/.local/bin/mirako"
 fallback = true                  # run locally when the host is unreachable
+gc_days = 7                      # remove a project's remote copy unused for this long (Gradle's caches there too); 0 = never
+# gc_after_pull = ["build/intermediates", "build/tmp"]   # deleted on the remote after every pull: saves disk, costs a clean build next time
 # ssh = ["ssh", "-o", "BatchMode=yes"]
 # exclude_local  = ["build"]
 # exclude_remote = ["src"]
@@ -62,13 +64,14 @@ A `mirako.toml` next to `gradlew` overrides any of these per project (`mirako in
 sample). The `*_extra` keys append instead of replacing:
 
 ```toml
-exclude_remote_extra = ["build/intermediates", "!build/intermediates/apk_ide_redirect_file", "build/tmp", "build/kotlin", "build/kspCaches"]
+exclude_remote_extra = ["build/intermediates", "!build/intermediates/apk_ide_redirect_file", "!build/intermediates/apk", "build/tmp", "build/kotlin", "build/kspCaches"]
 ```
 
 Patterns are rsync-like: `build` matches at any depth, `build/intermediates` matches that
 relative path at any depth, `/local.properties` is anchored at the project root, `*.log` is a
 glob that never crosses `/`. A `!pattern` keeps that path even if an earlier pattern excludes
-it (Android Studio needs `apk_ide_redirect_file` to find the APK after a build).
+it (Android Studio deploys through `apk_ide_redirect_file`, which points into
+`build/intermediates/apk`, so both come back).
 
 - `exclude_local`: not uploaded (your local build outputs)
 - `exclude_remote`: not downloaded (sources on the remote)
@@ -80,8 +83,24 @@ it (Android Studio needs `apk_ide_redirect_file` to find the APK after a build).
 mirako ./gradlew assembleDebug              # push → run → pull
 mirako run --no-pull -- ./gradlew test      # skip the download
 mirako push | mirako pull | mirako check    # the phases on their own
+mirako gc [--days N] [--dry-run]            # what is on the remote, remove the stale copies
 mirako --help
 ```
+
+### Keeping the remote's disk in check
+
+Every project gets a copy under `remote_folder`, build outputs included, and it stays there
+after you stop working on the project. After each run, and on `mirako gc`, the agent removes
+the copies that have not been synced for more than `gc_days` days (default 7; the copy of the
+project being built is never touched) and tells Gradle on the host to drop cache entries and
+wrapper distributions unused for the same time (`~/.gradle/init.d/mirako-gc.gradle`, removed
+again with `gc_days = 0`). A copy is recognised by the agent's own index of it, so other
+directories in `remote_folder` are listed but never removed. Leftover `.mirako.*.tmp` files
+from an interrupted transfer are deleted by the next scan on either side.
+
+`gc_after_pull` goes further: the patterns are deleted inside the project's remote copy after
+every pull, which is the one place the intermediates you never download can be reclaimed.
+The next build is then a clean build there, so leave it unset unless the disk is the problem.
 
 Use `ssh` `ControlMaster`/`ControlPersist` in `~/.ssh/config` so the connection is reused
 between builds; the handshake then costs ~70 ms.

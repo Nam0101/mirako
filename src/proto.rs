@@ -32,6 +32,44 @@ pub struct Entry {
     pub hash: [u8; 32],
 }
 
+/// What `mirako gc`, and every run when `gc_days` is set, asks the agent to clean up.
+#[derive(Serialize, Deserialize, Debug)]
+pub struct GcReq {
+    /// the `remote_folder`: every direct sub-directory mirako has synced before (it has an
+    /// index cache there) is a project mirror
+    pub folder: String,
+    /// remove mirrors not synced for more than this many days; `None` removes none
+    pub keep_days: Option<u32>,
+    /// the project of this session: never removed, and `build` is deleted inside it
+    pub current: Option<String>,
+    /// exclude-style patterns deleted inside `current` (intermediates the client never downloads)
+    pub build: Vec<String>,
+    /// Gradle's cache retention on the host in days (`~/.gradle/init.d/mirako-gc.gradle`); 0 restores its default
+    pub gradle_days: u32,
+    pub dry_run: bool,
+    /// measure every mirror, not only the removed ones
+    pub sizes: bool,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct Mirror {
+    pub name: String,
+    /// 0 when not measured
+    pub bytes: u64,
+    /// `None`: never synced by mirako, left alone
+    pub idle_days: Option<u32>,
+    pub removed: bool,
+}
+
+#[derive(Serialize, Deserialize, Debug, Default)]
+pub struct GcReport {
+    pub mirrors: Vec<Mirror>,
+    /// deleted inside `current` by the `build` patterns
+    pub build_bytes: u64,
+    /// free space on the volume of `folder`
+    pub free: u64,
+}
+
 /// A piece of a whole-file transfer, in either direction.
 #[derive(Serialize, Deserialize, Debug)]
 pub struct Chunk {
@@ -112,6 +150,8 @@ pub enum Req {
         paths: Vec<String>,
         sigs: Vec<(String, Signature)>,
     },
+    /// Housekeeping on the host; answered with `Gc`.
+    Gc(GcReq),
     Bye,
 }
 
@@ -146,6 +186,7 @@ pub enum Resp {
         target: String,
     },
     End,
+    Gc(GcReport),
     Error {
         msg: String,
     },

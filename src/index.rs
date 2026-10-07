@@ -4,6 +4,7 @@
 use crate::patterns::Matcher;
 use crate::proto::{Entry, Kind};
 use anyhow::{Context, Result};
+use filetime::FileTime;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -27,11 +28,19 @@ pub struct Index {
 
 impl Index {
     /// One cache per project root, under the OS cache dir (`~/Library/Caches/mirako` on macOS).
-    pub fn open(root: &Path) -> Self {
-        let dir = dirs::cache_dir().unwrap_or_else(std::env::temp_dir).join("mirako");
-        let _ = fs::create_dir_all(&dir);
+    /// It exists iff the root was synced, and its mtime is the last sync (see `save`): `gc`
+    /// recognises the mirrors on the host by it.
+    pub fn cache_path(root: &Path) -> PathBuf {
         let key = blake3::hash(root.to_string_lossy().as_bytes()).to_hex();
-        let cache_file = dir.join(format!("{}.idx", &key[..16]));
+        dirs::cache_dir()
+            .unwrap_or_else(std::env::temp_dir)
+            .join("mirako")
+            .join(format!("{}.idx", &key[..16]))
+    }
+
+    pub fn open(root: &Path) -> Self {
+        let cache_file = Self::cache_path(root);
+        let _ = fs::create_dir_all(cache_file.parent().unwrap());
         let cache = fs::read(&cache_file)
             .ok()
             .and_then(|b| bincode::deserialize(&b).ok())
@@ -71,6 +80,12 @@ impl Index {
                 continue; // an excluded parent on the way to a `!include`
             }
             let ft = e.file_type();
+            if ft.is_file() && is_leftover_tmp(&e.file_name().to_string_lossy()) {
+                // a transfer the peer never finished (dropped connection); nothing is in flight
+                // while a tree is scanned, so it is garbage on either side
+                let _ = fs::remove_file(e.path());
+                continue;
+            }
             if ft.is_symlink() {
                 let target = fs::read_link(e.path())?.to_string_lossy().into_owned();
                 let md = e.path().symlink_metadata()?;
@@ -140,8 +155,10 @@ impl Index {
         self.dirty = true;
     }
 
+    /// Writes the cache when it changed and leaves its mtime at "now" either way: on the agent
+    /// that is the mirror's last-used time `gc` goes by.
     pub fn save(&mut self) {
-        if !self.dirty {
+        if !self.dirty && filetime::set_file_mtime(&self.cache_file, FileTime::now()).is_ok() {
             return;
         }
         if let Ok(bytes) = bincode::serialize(&self.cache) {
@@ -152,6 +169,11 @@ impl Index {
         }
         self.dirty = false;
     }
+}
+
+/// `.mirako.<name>.tmp`, what `xfer::Inbox` writes before the rename into place.
+fn is_leftover_tmp(name: &str) -> bool {
+    name.starts_with(".mirako.") && name.ends_with(".tmp")
 }
 
 pub fn rel_path(root: &Path, p: &Path) -> String {
