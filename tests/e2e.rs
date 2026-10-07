@@ -8,10 +8,12 @@
 #![cfg(unix)] // the loopback "ssh" is `sh`, and the sandbox is `HOME`
 
 use std::fs;
+use std::io::{BufRead, BufReader};
 use std::os::unix::fs::{symlink, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
-use std::time::{Duration, SystemTime};
+use std::process::{Command, Output, Stdio};
+use std::thread;
+use std::time::{Duration, Instant, SystemTime};
 use tempfile::TempDir;
 
 const BIN: &str = env!("CARGO_BIN_EXE_mirako");
@@ -89,9 +91,10 @@ impl Scratch {
         p
     }
 
-    fn mirako(&self, args: &[&str]) -> Output {
-        Command::new(BIN)
-            .args(args)
+    /// `mirako <args…>` inside the sandbox, not started yet.
+    fn command(&self, args: &[&str]) -> Command {
+        let mut cmd = Command::new(BIN);
+        cmd.args(args)
             .current_dir(&self.path)
             .env("HOME", self.home())
             .env("GRADLE_USER_HOME", self.gradle_home())
@@ -99,9 +102,12 @@ impl Scratch {
             .env_remove("XDG_CACHE_HOME")
             .env_remove("MIRAKO_LOCAL")
             .env_remove("MIRAKO_REMOTE")
-            .env_remove("PWD")
-            .output()
-            .unwrap()
+            .env_remove("PWD");
+        cmd
+    }
+
+    fn mirako(&self, args: &[&str]) -> Output {
+        self.command(args).output().unwrap()
     }
 }
 
@@ -515,6 +521,124 @@ fn exec_output_streams_stderr_and_stdout_separately() {
     assert!(!stdout(&o).lines().any(|l| l == "err"), "{}", show(&o));
     assert!(stderr(&o).lines().any(|l| l == "err"), "{}", show(&o));
     assert!(!stderr(&o).lines().any(|l| l == "out"), "{}", show(&o));
+}
+
+#[test]
+fn local_properties_goes_up_without_its_machine_paths_and_never_comes_back() {
+    let s = Scratch::new();
+    let p = s.project("app", "");
+    let local = b"sdk.dir=/Users/me/Library/Android/sdk\nMAPS_API_KEY=abc\n";
+    p.write("local.properties", local);
+    p.write("src/a.txt", b"alpha\n");
+
+    let out = p.run_ok(&[], &["cat", "local.properties"]);
+    assert!(out.lines().any(|l| l == "MAPS_API_KEY=abc"), "{out}");
+    assert_eq!(read(&p.remote.join("local.properties")), b"MAPS_API_KEY=abc\n");
+    assert_eq!(
+        read(&p.root.join("local.properties")),
+        local,
+        "the host's copy came back over the local one"
+    );
+
+    // the host's copy counts as in sync with the local one
+    let out = p.run_ok(&[], &["true"]);
+    assert_eq!(counts(line(&out, "push")).0, 0, "{out}");
+    assert_eq!(counts(line(&out, "pull")).0, 0, "{out}");
+}
+
+#[test]
+fn only_the_variables_the_env_key_names_reach_the_remote_command() {
+    let s = Scratch::new();
+    // an "ssh" that, like the real one, hands none of the client's variables on to the agent
+    let ssh = format!(
+        "ssh = [\"env\", \"-u\", \"MK_ONE\", \"-u\", \"MK_PRE_X\", \"-u\", \"MK_OTHER\", \"sh\", \"-c\", {:?}]",
+        format!("exec {BIN} serve")
+    );
+    let p = s.project("app", &format!("{ssh}\nenv = [\"MK_ONE\", \"MK_PRE_*\"]"));
+    let script = "echo \"one=$MK_ONE pre=$MK_PRE_X other=$MK_OTHER remote=$MIRAKO_REMOTE\"";
+    let o = s
+        .command(&["run", "--project", p.root.to_str().unwrap(), "--", "sh", "-c", script])
+        .env("MK_ONE", "1")
+        .env("MK_PRE_X", "2")
+        .env("MK_OTHER", "3")
+        .output()
+        .unwrap();
+    assert_eq!(o.status.code(), Some(0), "{}", show(&o));
+    assert!(stdout(&o).lines().any(|l| l == "one=1 pre=2 other= remote=1"), "{}", show(&o));
+}
+
+#[test]
+fn a_second_run_of_the_project_waits_for_the_first() {
+    let s = Scratch::new();
+    let p = s.project("app", "");
+    p.write("src/a.txt", b"alpha\n");
+    let log = p.remote.join("build/log");
+    let first = "mkdir -p build && echo A-start >> build/log && sleep 1 && echo A-end >> build/log";
+    thread::scope(|scope| {
+        let a = scope.spawn(|| p.run(&[], &["sh", "-c", first]));
+        // the first run has the project once its command is running
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !log.exists() {
+            assert!(Instant::now() < deadline, "the first run never started its command");
+            thread::sleep(Duration::from_millis(10));
+        }
+        let b = p.run(&[], &["sh", "-c", "echo B-start >> build/log"]);
+        let a = a.join().unwrap();
+        assert_eq!(a.status.code(), Some(0), "{}", show(&a));
+        assert_eq!(b.status.code(), Some(0), "{}", show(&b));
+        assert!(stderr(&b).contains("another run of this project"), "{}", show(&b));
+    });
+    assert_eq!(read(&log), b"A-start\nA-end\nB-start\n");
+}
+
+/// Runs `script` on the remote, kills the client once the script has printed `started`, and says
+/// `wait` later whether the script got as far as its `touch finished`.
+fn finishes_after_its_client_is_killed(script: &str, wait: Duration) -> bool {
+    let s = Scratch::new();
+    let p = s.project("app", "");
+    p.write("src/a.txt", b"alpha\n");
+    let mut client = s
+        .command(&["run", "--project", p.root.to_str().unwrap(), "--", "sh", "-c", script])
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    // the command is running once its first line is here
+    let mut lines = BufReader::new(client.stdout.take().unwrap()).lines();
+    assert!(lines.any(|l| l.unwrap() == "started"));
+    client.kill().unwrap();
+    client.wait().unwrap();
+
+    thread::sleep(wait);
+    p.remote.join("finished").exists()
+}
+
+#[test]
+fn killing_the_client_stops_the_command_on_the_remote() {
+    // the marker is written by a child of the command's shell: its whole process group has to stop
+    let script = "echo started; (sleep 1; touch finished) & wait";
+    assert!(
+        !finishes_after_its_client_is_killed(script, Duration::from_millis(1500)),
+        "the command outlived its client"
+    );
+}
+
+#[test]
+fn killing_the_client_stops_what_the_command_left_running() {
+    // the shell is gone at once; its child holds the output open, so the run is not over
+    let script = "(sleep 1; touch finished) & echo started";
+    assert!(
+        !finishes_after_its_client_is_killed(script, Duration::from_millis(1500)),
+        "the child outlived the client"
+    );
+}
+
+#[test]
+fn a_command_that_ignores_the_first_signal_is_killed_after_the_grace_period() {
+    let script = "trap '' TERM; echo started; sleep 3; touch finished";
+    assert!(
+        !finishes_after_its_client_is_killed(script, Duration::from_millis(3500)),
+        "SIGTERM was the last word"
+    );
 }
 
 #[test]

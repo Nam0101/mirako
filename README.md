@@ -88,10 +88,11 @@ fallback = true                  # run locally when the host is unreachable
 gc_days = 7                      # remove a project's remote copy unused for this long (Gradle's caches there too); 0 = never
 # gc_after_pull = ["build/intermediates", "build/tmp"]   # deleted on the remote after every pull: saves disk, costs a clean build next time
 # shim_check = false             # Gradle shim: skip the ~0.1 s handshake before each build (a dead host then fails, or falls back, inside `mirako run`)
+# env = ["KEYSTORE_PASSWORD", "ORG_GRADLE_PROJECT_*"]    # variables of this machine the remote command gets (a name, or a prefix ending in *)
 # ssh = ["ssh", "-o", "BatchMode=yes"]
 # exclude_local  = ["build"]
 # exclude_remote = ["src"]
-# exclude_common = [".gradle", ".idea", ".git", ".kotlin", ".mirako", "local.properties", "mirako.toml", ".DS_Store"]
+# exclude_common = [".gradle", ".idea", ".git", ".kotlin", ".mirako", "mirako.toml", ".DS_Store"]
 ```
 
 A `mirako.toml` next to `gradlew` overrides any of these per project (`mirako init` writes a
@@ -111,6 +112,18 @@ it (Android Studio deploys through `apk_ide_redirect_file`, which points into
 - `exclude_remote`: not downloaded (sources on the remote)
 - `exclude_common`: never synced either way
 
+`local.properties` is uploaded without its `sdk.dir`, `ndk.dir` and `cmake.dir` lines: the keys a
+build reads from it (API keys, the secrets plugin) are there on the host, and the SDK is still
+found through the host's `ANDROID_HOME`. It is never downloaded. This goes for every file of
+that name in the project (an included build has its own). A `local.properties` written by hand
+on the host is replaced like any other file, which 0.5 did not do: the host's SDK path belongs
+in `ANDROID_HOME` (`mirako setup` checks it). To keep the file off the host altogether, add it
+to `exclude_local_extra`; a copy an earlier run uploaded stays there until you delete it.
+
+`env` names the environment variables of this machine that the remote command gets on top of
+the host's own (signing passwords, `ORG_GRADLE_PROJECT_*` properties): a name, or a prefix
+ending in `*`. They travel inside the ssh connection and are not written to the host's disk.
+
 ## Use
 
 ```
@@ -120,6 +133,15 @@ mirako push | mirako pull | mirako check    # the phases on their own
 mirako gc [--days N] [--dry-run]            # what is on the remote, remove the stale copies
 mirako --help
 ```
+
+Stopping a run (Ctrl-C, the stop button of Android Studio) stops the command on the host as
+well: when the connection closes the agent sends SIGTERM to the command and everything it
+started, and SIGKILL to what is left two seconds later at most. Two runs of one project never
+overlap: the second waits for the first.
+
+A transfer that takes more than a second reports on stderr how far it is
+(`push   42.0 MB of 95.4 MB, 12.1 MB/s`; a pull counts the bytes received): one line redrawn in
+place on a terminal, a line every five seconds anywhere else. `mirako run --quiet` leaves it out.
 
 ### Keeping the remote's disk in check
 
@@ -153,6 +175,16 @@ finishes.
 
 - one build locally: `./gradlew <task> -x mirako` (or `-Pmirako.disabled`)
 - `updateDaemonJvm` and `wrapper` (they edit the project's Gradle config) always run locally
+- `install<Variant>` of a debug or release variant (`installDebug`, `:app:installProductionDebug`,
+  `installDebugAndroidTest`) builds `assemble<Variant>` on the remote, then runs
+  `adb install -r -t` here with the pulled APK (the one `build/outputs/apk/**/output-metadata.json`
+  lists for that variant) on every attached device, or on the one `ANDROID_SERIAL` names. `adb`
+  is the one under `sdk.dir` of `local.properties`, else under `ANDROID_HOME`, else on the `PATH`.
+  A variant with several APKs (splits) fails with a message: build that one with `-x mirako`
+- a build with any other `install…` task, or an `uninstall…`, `connected…` or `deviceCheck` one,
+  runs locally: those talk to the device attached to this machine. Names are matched as typed,
+  so an abbreviation (`iD`) goes to the host as it is. (Run in Android Studio is none of these:
+  it assembles on the remote and deploys the pulled APK itself)
 - one project always local: `mirako.enabled=false` in its `local.properties`
 - host unreachable: the build simply runs locally. The script asks `mirako check` first (one
   handshake, ~0.1 s); `shim_check = false` in the global config skips that, and a dead host then

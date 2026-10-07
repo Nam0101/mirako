@@ -23,6 +23,7 @@ pub struct FileConfig {
     pub exclude_common_extra: Option<Vec<String>>,
     pub gc_days: Option<u32>,
     pub gc_after_pull: Option<Vec<String>>,
+    pub env: Option<Vec<String>>,
     /// global only: whether the Gradle init script runs `mirako check` before taking a build (default true)
     pub shim_check: Option<bool>,
 }
@@ -41,20 +42,13 @@ pub struct Config {
     pub gc_days: u32,
     /// deleted on the remote after every pull (rsync-like patterns)
     pub gc_after_pull: Vec<String>,
+    /// environment variables of this machine the remote command gets: a name, or a prefix ending in `*`
+    pub env: Vec<String>,
 }
 
 pub const DEFAULT_EXCLUDE_LOCAL: &[&str] = &["build"];
 pub const DEFAULT_EXCLUDE_REMOTE: &[&str] = &["src"];
-pub const DEFAULT_EXCLUDE_COMMON: &[&str] = &[
-    ".gradle",
-    ".idea",
-    ".git",
-    ".kotlin",
-    ".mirako",
-    "local.properties",
-    "mirako.toml",
-    ".DS_Store",
-];
+pub const DEFAULT_EXCLUDE_COMMON: &[&str] = &[".gradle", ".idea", ".git", ".kotlin", ".mirako", "mirako.toml", ".DS_Store"];
 
 /// `~/.config/mirako/config.toml` on every OS (macOS's Application Support is not where people look).
 pub fn global_config_path() -> PathBuf {
@@ -133,6 +127,7 @@ impl Config {
             ),
             gc_days: p.gc_days.or(g.gc_days).unwrap_or(7),
             gc_after_pull: p.gc_after_pull.clone().or(g.gc_after_pull.clone()).unwrap_or_default(),
+            env: p.env.clone().or(g.env.clone()).unwrap_or_default(),
         })
     }
 
@@ -140,8 +135,12 @@ impl Config {
         self.exclude_local.iter().chain(&self.exclude_common).cloned().collect()
     }
 
+    /// Always with `local.properties`: the host's copy is this machine's minus its own paths
+    /// (`client::portable_properties`), so pulling it would cut `sdk.dir` out of the original.
     pub fn download_excludes(&self) -> Vec<String> {
-        self.exclude_remote.iter().chain(&self.exclude_common).cloned().collect()
+        let mut v: Vec<String> = self.exclude_remote.iter().chain(&self.exclude_common).cloned().collect();
+        v.push("local.properties".into());
+        v
     }
 
     /// `~/mirako/<project name>` on the remote, still with the `~` for the remote shell/agent to expand.
@@ -207,10 +206,11 @@ fallback = true                  # run locally when the host is unreachable
 gc_days = 7                      # remove a project's remote copy unused for this long (Gradle's caches there too); 0 = never
 # gc_after_pull = ["build/intermediates", "build/tmp"]   # deleted on the remote after every pull: saves disk, costs a clean build next time
 # shim_check = false             # Gradle shim: skip the ~0.1 s handshake before each build (a dead host then fails, or falls back, inside `mirako run`)
+# env = ["KEYSTORE_PASSWORD", "ORG_GRADLE_PROJECT_*"]    # variables of this machine the remote command gets (a name, or a prefix ending in *)
 # ssh = ["ssh", "-o", "BatchMode=yes"]
 # exclude_local  = ["build"]
 # exclude_remote = ["src"]
-# exclude_common = [".gradle", ".idea", ".git", ".kotlin", ".mirako", "local.properties", "mirako.toml", ".DS_Store"]
+# exclude_common = [".gradle", ".idea", ".git", ".kotlin", ".mirako", "mirako.toml", ".DS_Store"]
 "#;
 
 #[cfg(test)]
@@ -264,6 +264,7 @@ mod tests {
         assert!(!c.fallback);
         assert_eq!(c.gc_days, 7);
         assert!(c.gc_after_pull.is_empty());
+        assert!(c.env.is_empty());
         assert_eq!(c.exclude_local, strings(DEFAULT_EXCLUDE_LOCAL));
         assert_eq!(c.exclude_remote, strings(DEFAULT_EXCLUDE_REMOTE));
         assert_eq!(c.exclude_common, strings(DEFAULT_EXCLUDE_COMMON));
@@ -349,6 +350,14 @@ mod tests {
     }
 
     #[test]
+    fn env_in_the_project_replaces_the_global_one() {
+        let s = Setup::new().global("env = [\"A\", \"B_*\"]\n");
+        assert_eq!(s.load(Some("h")).unwrap().env, strings(&["A", "B_*"]));
+        let s = s.project("env = [\"C\"]\n");
+        assert_eq!(s.load(Some("h")).unwrap().env, strings(&["C"]));
+    }
+
+    #[test]
     fn an_unknown_key_in_the_global_file_is_an_error_naming_it() {
         let s = Setup::new().global("hots = \"typo\"\n");
         let msg = format!("{:#}", s.load(Some("h")).unwrap_err());
@@ -373,7 +382,14 @@ mod tests {
         let s = Setup::new().project("exclude_local = [\"l\"]\nexclude_remote = [\"r\"]\nexclude_common = [\"c1\", \"c2\"]\n");
         let c = s.load(Some("h")).unwrap();
         assert_eq!(c.upload_excludes(), strings(&["l", "c1", "c2"]));
-        assert_eq!(c.download_excludes(), strings(&["r", "c1", "c2"]));
+        // whatever the lists say, local.properties is never downloaded
+        assert_eq!(c.download_excludes(), strings(&["r", "c1", "c2", "local.properties"]));
+    }
+
+    #[test]
+    fn local_properties_is_uploaded_by_default() {
+        let c = Setup::new().load(Some("h")).unwrap();
+        assert!(!c.upload_excludes().iter().any(|p| p.contains("local.properties")));
     }
 
     #[test]
