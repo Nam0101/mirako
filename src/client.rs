@@ -461,9 +461,9 @@ fn recv(reader: &mut BufReader<ChildStdout>) -> Result<Resp> {
 }
 
 /// Streams the output of the `Exec` queued earlier, remote paths rewritten to local ones.
-/// Returns the exit code. Works on the reader alone: the writer is busy on the scan thread
-/// meanwhile (see `run`).
-fn exec_output(reader: &mut BufReader<ChildStdout>, remote_home: &str, remote_dir: &str, local_root: &Path) -> Result<i32> {
+/// Returns the exit code and whether the command printed anything. Works on the reader alone:
+/// the writer is busy on the scan thread meanwhile (see `run`).
+fn exec_output(reader: &mut BufReader<ChildStdout>, remote_home: &str, remote_dir: &str, local_root: &Path) -> Result<(i32, bool)> {
     // the remote project path (`~` expanded with the agent's home) for output rewriting
     let remote_abs = match remote_dir.strip_prefix("~/") {
         Some(r) => format!("{remote_home}/{r}"),
@@ -474,9 +474,11 @@ fn exec_output(reader: &mut BufReader<ChildStdout>, remote_home: &str, remote_di
     let mut err_rw = LineRewriter::new(&remote_abs, &local);
     let stdout = io::stdout();
     let stderr = io::stderr();
+    let mut printed = false;
     loop {
         match recv(reader)? {
             Resp::Output { stderr: is_err, data } => {
+                printed |= !data.is_empty();
                 if is_err {
                     let mut h = stderr.lock();
                     h.write_all(&err_rw.feed(&data))?;
@@ -490,7 +492,7 @@ fn exec_output(reader: &mut BufReader<ChildStdout>, remote_home: &str, remote_di
             Resp::Exit { code } => {
                 stdout.lock().write_all(&out_rw.flush())?;
                 stderr.lock().write_all(&err_rw.flush())?;
-                return Ok(code);
+                return Ok((code, printed));
             }
             other => bail!("unexpected reply {other:?}"),
         }
@@ -596,6 +598,40 @@ fn secs(t: Instant) -> String {
     format!("{:.1}s", t.elapsed().as_secs_f64())
 }
 
+/// What a run prints first: the project and the host, next to a small Buddha who keeps the bugs away.
+fn header(project: &str, host: &str) -> String {
+    format!(
+        r"    _oo0oo_
+   (| -_- |)    mirako {} · {project} → {host}
+   0\  =  /0    Phật phù hộ, không bao giờ BUG
+ ___/`---'\___",
+        proto::VERSION
+    )
+}
+
+/// `push   12 files (3 as delta), 95.4 MB (12.1 MB on the wire), 2 deleted, 8.2s`: the summary
+/// line of a push or a pull, without the parts that are zero.
+fn summary(label: &str, s: &Stats, took: &str) -> String {
+    let mut parts = Vec::new();
+    if s.files > 0 {
+        let files = if s.files == 1 { "file" } else { "files" };
+        let deltas = if s.deltas > 0 {
+            format!(" ({} as delta)", s.deltas)
+        } else {
+            String::new()
+        };
+        parts.push(format!("{} {files}{deltas}", s.files));
+        parts.push(format!("{} ({} on the wire)", human(s.bytes), human(s.wire)));
+    }
+    if s.deleted > 0 {
+        parts.push(format!("{} deleted", s.deleted));
+    }
+    if parts.is_empty() {
+        parts.push("up to date".into());
+    }
+    format!("{label:<6} {}, {took}", parts.join(", "))
+}
+
 /// One run per project at a time, a second one waits here for the first: both would write the
 /// same files on either side, and a scan takes every `.mirako.*.tmp` it meets for a leftover and
 /// deletes it. The lock is the returned file (next to the project's index cache), held until it
@@ -650,12 +686,7 @@ pub fn run(root: &Path, cfg: &Config, cmd: &[String], opts: &RunOptions) -> Resu
             println!("{s}")
         }
     };
-    say(format!(
-        "mirako {}: {} on {}",
-        proto::VERSION,
-        root.file_name().unwrap_or_default().to_string_lossy(),
-        cfg.host
-    ));
+    say(header(&root.file_name().unwrap_or_default().to_string_lossy(), &cfg.host));
     let mut index = Index::open(root);
 
     // the `Exec` goes out with the push's `Flush`, so the agent starts the command without
@@ -673,15 +704,7 @@ pub fn run(root: &Path, cfg: &Config, cmd: &[String], opts: &RunOptions) -> Resu
         let t = Instant::now();
         let s = session.push(root, &mut index, &remote_dir, &push_excludes, &after)?;
         index.save();
-        say(format!(
-            "push   {} files ({} as delta), {} → {} on the wire, {} deleted, {}",
-            s.files,
-            s.deltas,
-            human(s.bytes),
-            human(s.wire),
-            s.deleted,
-            secs(t)
-        ));
+        say(summary("push", &s, &secs(t)));
     } else {
         for r in &after {
             session.send(r)?;
@@ -731,7 +754,13 @@ pub fn run(root: &Path, cfg: &Config, cmd: &[String], opts: &RunOptions) -> Resu
         });
         if !cmd.is_empty() {
             let t = Instant::now();
-            code = exec_output(reader, remote_home, &remote_dir, root)?;
+            // an empty line on either side of the command's output sets it apart from these lines
+            say(String::new());
+            let printed;
+            (code, printed) = exec_output(reader, remote_home, &remote_dir, root)?;
+            if printed {
+                say(String::new());
+            }
             say(format!("exec   exit {code}, {}", secs(t)));
         }
         scan.join().expect("scan thread panicked")
@@ -759,14 +788,7 @@ pub fn run(root: &Path, cfg: &Config, cmd: &[String], opts: &RunOptions) -> Resu
         let t = Instant::now();
         let (s, gc) = session.pull(root, &mut index, &remote_dir, gc_queued)?;
         index.save();
-        say(format!(
-            "pull   {} files ({} as delta), {} → {} on the wire, {}",
-            s.files,
-            s.deltas,
-            human(s.bytes),
-            human(s.wire),
-            secs(t)
-        ));
+        say(summary("pull", &s, &secs(t)));
         if let Some(r) = gc {
             report(r);
         }
@@ -1006,6 +1028,24 @@ mod tests {
         assert_eq!(portable_properties(b""), b"");
         assert!(is_local_properties("local.properties") && is_local_properties("app/local.properties"));
         assert!(!is_local_properties("app/xlocal.properties") && !is_local_properties("local.properties/x"));
+    }
+
+    #[test]
+    fn summary_leaves_out_what_is_zero() {
+        let mut s = Stats::default();
+        assert_eq!(summary("push", &s, "0.1s"), "push   up to date, 0.1s");
+        s.deleted = 2;
+        assert_eq!(summary("push", &s, "0.1s"), "push   2 deleted, 0.1s");
+        (s.files, s.bytes, s.wire) = (1, 60 << 10, 47 << 10);
+        assert_eq!(
+            summary("push", &s, "0.1s"),
+            "push   1 file, 60 KB (47 KB on the wire), 2 deleted, 0.1s"
+        );
+        (s.files, s.deltas, s.deleted) = (12, 3, 0);
+        assert_eq!(
+            summary("pull", &s, "8.2s"),
+            "pull   12 files (3 as delta), 60 KB (47 KB on the wire), 8.2s"
+        );
     }
 
     #[test]
