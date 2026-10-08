@@ -29,7 +29,7 @@ jobs:
     runs-on: [self-hosted, macOS, ARM64, m4]
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
       - run: rustc --version && cargo --version
       - run: cargo fmt --check
@@ -42,13 +42,13 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { name: linux-x86_64, os: ubuntu-latest, target: x86_64-unknown-linux-musl }
-          - { name: linux-arm64, os: ubuntu-24.04-arm, target: aarch64-unknown-linux-musl }
+          - { name: linux-x86_64, os: ubuntu-26.04, target: x86_64-unknown-linux-musl }
+          - { name: linux-arm64, os: ubuntu-26.04-arm, target: aarch64-unknown-linux-musl }
           - { name: windows-x86_64, os: windows-latest, target: x86_64-pc-windows-msvc }
     runs-on: ${{ matrix.os }}
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: rustup update stable --no-self-update && rustup default stable && rustup target add ${{ matrix.target }} && rustup component add clippy
       - if: runner.os == 'Linux'
         # a stalled mirror once held `apt-get update` for 13 minutes: three tries of 90 s, and the
@@ -68,12 +68,12 @@ jobs:
     runs-on: [self-hosted, macOS, ARM64, m4]
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
       # criterion keeps the previous run under target/criterion on this runner, so the
       # output includes the change against the last main push
       - run: cargo bench 2>&1 | tee bench.txt
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: bench-${{ github.sha }}
           path: |
@@ -89,8 +89,8 @@ jobs:
       matrix:
         include:
           - { name: macos-arm64, os: [self-hosted, macOS, ARM64, m4], target: aarch64-apple-darwin }
-          - { name: linux-x86_64, os: ubuntu-latest, target: x86_64-unknown-linux-musl }
-          - { name: linux-arm64, os: ubuntu-24.04-arm, target: aarch64-unknown-linux-musl }
+          - { name: linux-x86_64, os: ubuntu-26.04, target: x86_64-unknown-linux-musl }
+          - { name: linux-arm64, os: ubuntu-26.04-arm, target: aarch64-unknown-linux-musl }
           - { name: windows-x86_64, os: windows-latest, target: x86_64-pc-windows-msvc, exe: .exe }
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
@@ -98,7 +98,7 @@ jobs:
       run:
         shell: bash
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: the tag must match Cargo.toml (the protocol version)
         run: |
           v=$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
@@ -120,7 +120,7 @@ jobs:
       - run: |
           mkdir -p dist
           cp "target/${{ matrix.target }}/release/mirako${{ matrix.exe }}" "dist/mirako-${GITHUB_REF_NAME}-${{ matrix.name }}${{ matrix.exe }}"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: mirako-${{ github.ref_name }}-${{ matrix.name }}
           path: dist
@@ -129,12 +129,12 @@ jobs:
     name: github release
     needs: build
     if: startsWith(github.ref, 'refs/tags/v')
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 10
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           pattern: mirako-*
           path: dist
