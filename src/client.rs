@@ -693,8 +693,9 @@ pub fn run(root: &Path, cfg: &Config, cmd: &[String], opts: &RunOptions) -> Resu
     // once they are not needed any more, i.e. after a pull), Gradle's retention. Never fails a
     // build. When it leaves the current copy alone it is queued right behind the `Pull`, so its
     // report comes back in the same stream; deleting `gc_after_pull` inside the copy has to wait
-    // until the pull, retries included, is complete.
-    let gc_req = (cfg.gc_days > 0 || (opts.pull && !cfg.gc_after_pull.is_empty())).then(|| GcReq {
+    // until the pull, retries included, is complete. With `gc_days = 0` it still goes out behind a
+    // `Pull`, where it costs no round trip: that is what takes Gradle's retention script off the host.
+    let gc_req = (cfg.gc_days > 0 || opts.pull).then(|| GcReq {
         folder: cfg.remote_folder.clone(),
         keep_days: (cfg.gc_days > 0).then_some(cfg.gc_days),
         current: Some(remote_dir.clone()),
