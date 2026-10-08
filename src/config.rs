@@ -47,7 +47,18 @@ pub struct Config {
 }
 
 pub const DEFAULT_EXCLUDE_LOCAL: &[&str] = &["build"];
-pub const DEFAULT_EXCLUDE_REMOTE: &[&str] = &["src"];
+/// `src` plus what an Android build leaves on the host that nobody here reads: the IDE still gets
+/// build/outputs, build/generated (R, navigation, KSP) and, to deploy, the apk_ide_redirect_file
+/// with the build/intermediates/apk it points at.
+pub const DEFAULT_EXCLUDE_REMOTE: &[&str] = &[
+    "src",
+    "build/intermediates",
+    "!build/intermediates/apk_ide_redirect_file",
+    "!build/intermediates/apk",
+    "build/tmp",
+    "build/kotlin",
+    "build/kspCaches",
+];
 pub const DEFAULT_EXCLUDE_COMMON: &[&str] = &[".gradle", ".idea", ".git", ".kotlin", ".mirako", "mirako.toml", ".DS_Store"];
 
 /// `~/.config/mirako/config.toml` on every OS (macOS's Application Support is not where people look).
@@ -190,10 +201,6 @@ pub const SAMPLE_PROJECT_TOML: &str = r#"# mirako.toml — per-project settings 
 # remote_folder = "~/mirako"
 # fallback = true
 
-# Android: the IDE needs build/outputs, build/generated (navigation) and, to deploy, the
-# apk_ide_redirect_file plus the build/intermediates/apk it points at
-exclude_remote_extra = ["build/intermediates", "!build/intermediates/apk_ide_redirect_file", "!build/intermediates/apk", "build/tmp", "build/kotlin", "build/kspCaches"]
-
 # Free the remote's disk after every pull at the price of a clean build next time:
 # gc_after_pull = ["build/intermediates", "build/tmp", "build/kotlin", "build/kspCaches"]
 "#;
@@ -209,7 +216,7 @@ gc_days = 7                      # remove a project's remote copy unused for thi
 # env = ["KEYSTORE_PASSWORD", "ORG_GRADLE_PROJECT_*"]    # variables of this machine the remote command gets (a name, or a prefix ending in *)
 # ssh = ["ssh", "-o", "BatchMode=yes"]
 # exclude_local  = ["build"]
-# exclude_remote = ["src"]
+# exclude_remote = ["src", "build/intermediates", "!build/intermediates/apk_ide_redirect_file", "!build/intermediates/apk", "build/tmp", "build/kotlin", "build/kspCaches"]
 # exclude_common = [".gradle", ".idea", ".git", ".kotlin", ".mirako", "mirako.toml", ".DS_Store"]
 "#;
 
@@ -390,6 +397,30 @@ mod tests {
     fn local_properties_is_uploaded_by_default() {
         let c = Setup::new().load(Some("h")).unwrap();
         assert!(!c.upload_excludes().iter().any(|p| p.contains("local.properties")));
+    }
+
+    #[test]
+    fn the_default_download_scope_is_what_android_studio_reads() {
+        let c = Setup::new().load(Some("h")).unwrap();
+        let m = crate::patterns::Matcher::new(&c.download_excludes()).unwrap();
+        for kept in [
+            "app/build/outputs/apk/debug/app-debug.apk",
+            "app/build/generated/source/buildConfig/debug/BuildConfig.java",
+            "app/build/intermediates/apk/debug/app-debug.apk",
+            "app/build/intermediates/apk_ide_redirect_file/debug/redirect.txt",
+            "app/build/reports/tests/index.html",
+        ] {
+            assert!(!m.excluded(kept), "{kept}");
+        }
+        for left in [
+            "app/src/main/java/A.kt",
+            "app/build/intermediates/dex/debug/classes.dex",
+            "app/build/tmp/kotlin-classes/debug/A.class",
+            "app/build/kotlin/compileDebugKotlin/cacheable/caches-jvm/a.tab",
+            "app/build/kspCaches/debug/symbols",
+        ] {
+            assert!(m.excluded(left), "{left}");
+        }
     }
 
     #[test]

@@ -91,7 +91,7 @@ gc_days = 7                      # remove a project's remote copy unused for thi
 # env = ["KEYSTORE_PASSWORD", "ORG_GRADLE_PROJECT_*"]    # variables of this machine the remote command gets (a name, or a prefix ending in *)
 # ssh = ["ssh", "-o", "BatchMode=yes"]
 # exclude_local  = ["build"]
-# exclude_remote = ["src"]
+# exclude_remote = ["src", "build/intermediates", "!build/intermediates/apk_ide_redirect_file", "!build/intermediates/apk", "build/tmp", "build/kotlin", "build/kspCaches"]
 # exclude_common = [".gradle", ".idea", ".git", ".kotlin", ".mirako", "mirako.toml", ".DS_Store"]
 ```
 
@@ -99,7 +99,7 @@ A `mirako.toml` next to `gradlew` overrides any of these per project (`mirako in
 sample). The `*_extra` keys append instead of replacing:
 
 ```toml
-exclude_remote_extra = ["build/intermediates", "!build/intermediates/apk_ide_redirect_file", "!build/intermediates/apk", "build/tmp", "build/kotlin", "build/kspCaches"]
+exclude_remote_extra = ["build/reports"]
 ```
 
 Patterns are rsync-like: `build` matches at any depth, `build/intermediates` matches that
@@ -108,9 +108,17 @@ glob that never crosses `/`. A `!pattern` keeps that path even if an earlier pat
 it (Android Studio deploys through `apk_ide_redirect_file`, which points into
 `build/intermediates/apk`, so both come back).
 
+The default `exclude_remote` leaves on the host the Android intermediates nobody reads here
+(`build/intermediates` but its `apk` and `apk_ide_redirect_file`, `build/tmp`, `build/kotlin`,
+`build/kspCaches`), so a project without a `mirako.toml` pulls back only what Android Studio
+uses. Setting `exclude_remote` replaces that list; `exclude_remote_extra` adds to it.
+
 - `exclude_local`: not uploaded (your local build outputs)
-- `exclude_remote`: not downloaded (sources on the remote)
+- `exclude_remote`: not downloaded (sources on the remote, Android intermediates)
 - `exclude_common`: never synced either way
+
+A pull compares content: a file whose mode alone changed on the host keeps its mode here until
+its content changes too.
 
 `local.properties` is uploaded without its `sdk.dir`, `ndk.dir` and `cmake.dir` lines: the keys a
 build reads from it (API keys, the secrets plugin) are there on the host, and the SDK is still
@@ -142,6 +150,12 @@ overlap: the second waits for the first.
 A transfer that takes more than a second reports on stderr how far it is
 (`push   42.0 MB of 95.4 MB, 12.1 MB/s`; a pull counts the bytes received): one line redrawn in
 place on a terminal, a line every five seconds anywhere else. `mirako run --quiet` leaves it out.
+
+A run then says where its time went, one line per phase: `ssh` is the connection, the agent
+starting and the handshake; `push` and `pull` end with the scan times that were not hidden
+behind other work, `(scan 0.4s, host scan 1.1s)`: the local scan (for a pull, what is left of it
+once the command ends) and the wait for the host's first byte after it. A time under 50 ms is
+left out.
 
 ### Keeping the remote's disk in check
 

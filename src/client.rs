@@ -15,11 +15,11 @@ use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::fs::{self, TryLockError};
-use std::io::{self, BufReader, BufWriter, Read, Write};
+use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdout, Command, Stdio};
 use std::thread;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// Non-interactive, and give up fast when the host is asleep or off the network so the
 /// Gradle shim falls back to a local build instead of hanging on the TCP timeout.
@@ -62,6 +62,10 @@ pub struct Stats {
     pub wire: u64,
     pub deleted: usize,
     pub deltas: usize,
+    /// the local scan, as far as nothing else hid it (the command, for a pull)
+    pub scan: Duration,
+    /// waiting for the host's first byte after the local scan: its scan, as far as ours did not hide it
+    pub host: Duration,
 }
 
 impl Session {
@@ -191,6 +195,7 @@ impl Session {
     /// `Manifest` request went out with the handshake (`connect`), so the agent scans its copy
     /// while the local scan runs here. `after` is queued behind the final `Flush` (see `flush_and`).
     pub fn push(&mut self, root: &Path, index: &mut Index, remote_dir: &str, exclude: &[String], after: &[Req]) -> Result<Stats> {
+        let t = Instant::now();
         let mut local = index.scan(root, &Matcher::new(exclude)?)?;
         // a `local.properties` goes up as `portable_properties` leaves it, so its entry describes that content
         let mut portable: HashMap<String, Vec<u8>> = HashMap::new();
@@ -200,6 +205,13 @@ impl Session {
             e.hash = *blake3::hash(&bytes).as_bytes();
             portable.insert(e.path.clone(), bytes);
         }
+        let mut stats = Stats {
+            scan: t.elapsed(),
+            ..Default::default()
+        };
+        let t = Instant::now();
+        self.reader.fill_buf()?;
+        stats.host = t.elapsed();
         let remote = match self.recv()? {
             Resp::Manifest { entries, .. } => entries,
             other => bail!("unexpected reply {other:?}"),
@@ -242,10 +254,7 @@ impl Session {
             }
         };
 
-        let mut stats = Stats {
-            deleted: to_delete.len(),
-            ..Default::default()
-        };
+        stats.deleted = to_delete.len();
         if !to_delete.is_empty() {
             self.send(&Req::Delete { paths: to_delete })?;
         }
@@ -387,6 +396,9 @@ impl Session {
     fn receive(&mut self, root: &Path, index: &mut Index, stats: &mut Stats) -> Result<Vec<String>> {
         let mut inbox = Inbox::default();
         let mut failed = Vec::new();
+        let t = Instant::now();
+        self.reader.fill_buf()?;
+        stats.host += t.elapsed();
         // Windows: the links of the host, which this side does not make (see `xfer::make_symlink`)
         let mut no_link = Vec::new();
         let mut progress = Progress::new("pull", None, !self.quiet);
@@ -395,7 +407,7 @@ impl Session {
                 Resp::Put(chunk) => {
                     stats.wire += chunk.data.len() as u64;
                     progress.add(chunk.data.len() as u64);
-                    if let Some(f) = inbox.put(root, &chunk)? {
+                    if let Some(f) = inbox.put(root, chunk)? {
                         stats.files += 1;
                         stats.bytes += f.size;
                         index.remember(&f.path, f.size, f.mtime_ns, f.hash);
@@ -428,6 +440,11 @@ impl Session {
                 Resp::End => break,
                 other => bail!("unexpected reply {other:?}"),
             }
+        }
+        for f in inbox.settle()? {
+            stats.files += 1;
+            stats.bytes += f.size;
+            index.remember(&f.path, f.size, f.mtime_ns, f.hash);
         }
         drop(progress);
         if let Some(first) = no_link.first() {
@@ -595,7 +612,11 @@ pub fn human(bytes: u64) -> String {
 }
 
 fn secs(t: Instant) -> String {
-    format!("{:.1}s", t.elapsed().as_secs_f64())
+    secs_of(t.elapsed())
+}
+
+fn secs_of(d: Duration) -> String {
+    format!("{:.1}s", d.as_secs_f64())
 }
 
 /// What a run prints first: the project and the host, next to a small Buddha who keeps the bugs away.
@@ -609,8 +630,8 @@ fn header(project: &str, host: &str) -> String {
     )
 }
 
-/// `push   12 files (3 as delta), 95.4 MB (12.1 MB on the wire), 2 deleted, 8.2s`: the summary
-/// line of a push or a pull, without the parts that are zero.
+/// `push   12 files (3 as delta), 95.4 MB (12.1 MB on the wire), 2 deleted, 8.2s (scan 0.4s, host scan 1.1s)`:
+/// the summary line of a push or a pull, without the parts that are zero (a time under 50 ms reads as 0.0s).
 fn summary(label: &str, s: &Stats, took: &str) -> String {
     let mut parts = Vec::new();
     if s.files > 0 {
@@ -629,7 +650,18 @@ fn summary(label: &str, s: &Stats, took: &str) -> String {
     if parts.is_empty() {
         parts.push("up to date".into());
     }
-    format!("{label:<6} {}, {took}", parts.join(", "))
+    let mut times = Vec::new();
+    for (name, d) in [("scan", s.scan), ("host scan", s.host)] {
+        if d >= Duration::from_millis(50) {
+            times.push(format!("{name} {}", secs_of(d)));
+        }
+    }
+    let times = if times.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", times.join(", "))
+    };
+    format!("{label:<6} {}, {took}{times}", parts.join(", "))
 }
 
 /// One run per project at a time, a second one waits here for the first: both would write the
@@ -669,6 +701,7 @@ pub fn run(root: &Path, cfg: &Config, cmd: &[String], opts: &RunOptions) -> Resu
         dir: remote_dir.clone(),
         exclude: push_excludes.clone(),
     });
+    let connecting = Instant::now();
     let mut session = match Session::connect(cfg, first.as_ref()) {
         Ok(s) => s,
         Err(e) if cfg.fallback && !cmd.is_empty() => {
@@ -687,6 +720,8 @@ pub fn run(root: &Path, cfg: &Config, cmd: &[String], opts: &RunOptions) -> Resu
         }
     };
     say(header(&root.file_name().unwrap_or_default().to_string_lossy(), &cfg.host));
+    // ssh, the agent starting up and the handshake (an install of the agent too, when it needed one)
+    say(format!("ssh    {}", secs(connecting)));
     let mut index = Index::open(root);
 
     // the `Exec` goes out with the push's `Flush`, so the agent starts the command without
@@ -734,6 +769,8 @@ pub fn run(root: &Path, cfg: &Config, cmd: &[String], opts: &RunOptions) -> Resu
     // and sent up as the `Pull` request, so the agent streams the outputs the moment the command
     // exits; the main thread meanwhile prints the command's output
     let mut code = 0;
+    // when the command ended (or the pull scan began, without one): what the scan takes past it is the pull's
+    let mut exec_end = Instant::now();
     let Session {
         reader,
         writer,
@@ -758,6 +795,7 @@ pub fn run(root: &Path, cfg: &Config, cmd: &[String], opts: &RunOptions) -> Resu
             say(String::new());
             let printed;
             (code, printed) = exec_output(reader, remote_home, &remote_dir, root)?;
+            exec_end = Instant::now();
             if printed {
                 say(String::new());
             }
@@ -765,6 +803,7 @@ pub fn run(root: &Path, cfg: &Config, cmd: &[String], opts: &RunOptions) -> Resu
         }
         scan.join().expect("scan thread panicked")
     })?;
+    let pull_scan = exec_end.elapsed();
 
     let report = |r: Result<GcReport>| match r {
         Ok(r) => {
@@ -785,10 +824,10 @@ pub fn run(root: &Path, cfg: &Config, cmd: &[String], opts: &RunOptions) -> Resu
         Err(e) => eprintln!("mirako: gc: {e:#}"),
     };
     if opts.pull {
-        let t = Instant::now();
-        let (s, gc) = session.pull(root, &mut index, &remote_dir, gc_queued)?;
+        let (mut s, gc) = session.pull(root, &mut index, &remote_dir, gc_queued)?;
         index.save();
-        say(summary("pull", &s, &secs(t)));
+        s.scan = pull_scan;
+        say(summary("pull", &s, &secs(exec_end)));
         if let Some(r) = gc {
             report(r);
         }
@@ -1045,6 +1084,17 @@ mod tests {
         assert_eq!(
             summary("pull", &s, "8.2s"),
             "pull   12 files (3 as delta), 60 KB (47 KB on the wire), 8.2s"
+        );
+        // the scan times show from 50 ms, each on its own
+        (s.scan, s.host) = (Duration::from_millis(49), Duration::from_millis(50));
+        assert_eq!(
+            summary("pull", &s, "8.2s"),
+            "pull   12 files (3 as delta), 60 KB (47 KB on the wire), 8.2s (host scan 0.1s)"
+        );
+        s.scan = Duration::from_millis(1240);
+        assert_eq!(
+            summary("push", &Stats { files: 0, deltas: 0, ..s }, "1.4s"),
+            "push   up to date, 1.4s (scan 1.2s, host scan 0.1s)"
         );
     }
 

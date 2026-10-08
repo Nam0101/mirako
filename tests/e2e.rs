@@ -7,9 +7,12 @@
 
 #![cfg(unix)] // the loopback "ssh" is `sh`, and the sandbox is `HOME`
 
+use proptest::prelude::*;
+use proptest::test_runner::RngSeed;
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::{BufRead, BufReader};
-use std::os::unix::fs::{symlink, PermissionsExt};
+use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::thread;
@@ -824,4 +827,239 @@ fn setup_checks_ssh_reports_the_host_and_installs_shim_and_agent() {
     let o = s.mirako(&["setup"]);
     assert_eq!(o.status.code(), Some(2), "{}", show(&o));
     assert!(stderr(&o).contains("ssh loop failed: Permission denied"), "{}", show(&o));
+}
+
+// Properties of the sync: random sequences of changes, each round synced by the real binary.
+
+/// Paths a push round changes. `a`, `a/b` and `c` are files at times and directories at others,
+/// so a round can turn one into the other (the remote deletes before it writes).
+const PUSH_PATHS: &[&str] = &["a", "a/f", "a/b", "a/b/g", "c", "c/h.txt", "top"];
+/// Paths a pull round changes on the host: files only, under directories that stay directories,
+/// since a pull never deletes here and so cannot put a file where a directory still is.
+const PULL_PATHS: &[&str] = &["a/f", "a/b/g", "c/h.txt", "top", "d/e/i"];
+const LINK_TARGETS: &[&str] = &["a/f", "nowhere", "../top"];
+
+#[derive(Debug, Clone)]
+enum Op {
+    /// `len` from 260 000 up makes a file the next round sends as a delta once it is edited
+    Write {
+        path: &'static str,
+        len: usize,
+        seed: u64,
+    },
+    /// overwrite 100 bytes, or insert 700, at `at / 65536` of a regular file
+    Edit {
+        path: &'static str,
+        at: u16,
+        insert: bool,
+        seed: u64,
+    },
+    Delete {
+        path: &'static str,
+    },
+    Chmod {
+        path: &'static str,
+        exec: bool,
+    },
+    Symlink {
+        path: &'static str,
+        target: &'static str,
+    },
+    Rename {
+        from: &'static str,
+        to: &'static str,
+    },
+}
+
+fn op(paths: &'static [&'static str]) -> impl Strategy<Value = Op> {
+    let path = || proptest::sample::select(paths);
+    let len = prop_oneof![3 => 0..2_000usize, 1 => 260_000..400_000usize];
+    prop_oneof![
+        4 => (path(), len, any::<u64>()).prop_map(|(path, len, seed)| Op::Write { path, len, seed }),
+        3 => (path(), any::<u16>(), any::<bool>(), any::<u64>())
+            .prop_map(|(path, at, insert, seed)| Op::Edit { path, at, insert, seed }),
+        2 => path().prop_map(|path| Op::Delete { path }),
+        1 => (path(), any::<bool>()).prop_map(|(path, exec)| Op::Chmod { path, exec }),
+        1 => (path(), proptest::sample::select(LINK_TARGETS)).prop_map(|(path, target)| Op::Symlink { path, target }),
+        1 => (path(), path()).prop_map(|(from, to)| Op::Rename { from, to }),
+    ]
+}
+
+/// `chmod`: whether rounds change modes. A pull diffs by content and kind only, so a mode changed
+/// alone on the host stays there (with the mode in its diff, a Windows client, where every mode
+/// reads 0755, would download every file on every pull).
+fn rounds(paths: &'static [&'static str], chmod: bool) -> impl Strategy<Value = Vec<Vec<Op>>> {
+    let op = op(paths).prop_filter("no chmod", move |o| chmod || !matches!(o, Op::Chmod { .. }));
+    proptest::collection::vec(proptest::collection::vec(op, 1..6), 1..5)
+}
+
+/// Each case starts a few binaries, so few cases, from a fixed seed: every run checks the same ones.
+fn sync_config() -> ProptestConfig {
+    ProptestConfig {
+        cases: 12,
+        rng_seed: RngSeed::Fixed(0x6d69_7261_6b6f),
+        max_shrink_iters: 200,
+        ..ProptestConfig::default()
+    }
+}
+
+fn is_regular(p: &Path) -> bool {
+    fs::symlink_metadata(p).is_ok_and(|m| m.is_file())
+}
+
+/// Makes room for a file at `rel`: an ancestor that is not a directory goes, and so does
+/// whatever is at `rel` itself.
+fn clear_for(root: &Path, rel: &str) {
+    let mut at = root.to_path_buf();
+    let parts: Vec<&str> = rel.split('/').collect();
+    for dir in &parts[..parts.len() - 1] {
+        at.push(dir);
+        if fs::symlink_metadata(&at).is_ok_and(|m| !m.is_dir()) {
+            fs::remove_file(&at).unwrap();
+        }
+    }
+    let p = root.join(rel);
+    match fs::symlink_metadata(&p) {
+        Ok(m) if m.is_dir() => fs::remove_dir_all(&p).unwrap(),
+        Ok(_) => fs::remove_file(&p).unwrap(),
+        Err(_) => {}
+    }
+    fs::create_dir_all(p.parent().unwrap()).unwrap();
+}
+
+/// A new mtime for every change: the index takes a file with the size and mtime it knows for unchanged.
+fn touch(p: &Path, clock: &mut i64) {
+    *clock += 1;
+    filetime::set_file_mtime(p, filetime::FileTime::from_unix_time(1_600_000_000 + *clock, 0)).unwrap();
+}
+
+fn apply(root: &Path, op: &Op, clock: &mut i64) {
+    match *op {
+        Op::Write { path, len, seed } => {
+            clear_for(root, path);
+            fs::write(root.join(path), noise(len, seed)).unwrap();
+            touch(&root.join(path), clock);
+        }
+        Op::Edit { path, at, insert, seed } => {
+            let p = root.join(path);
+            if !is_regular(&p) {
+                return;
+            }
+            let mut data = fs::read(&p).unwrap();
+            let pos = at as usize * data.len() / 65_536;
+            if insert {
+                data.splice(pos..pos, noise(700, seed));
+            } else {
+                let end = (pos + 100).min(data.len());
+                data.splice(pos..end, noise(end - pos, seed));
+            }
+            fs::write(&p, data).unwrap();
+            touch(&p, clock);
+        }
+        Op::Delete { path } => match fs::symlink_metadata(root.join(path)) {
+            Ok(m) if m.is_dir() => fs::remove_dir_all(root.join(path)).unwrap(),
+            Ok(_) => fs::remove_file(root.join(path)).unwrap(),
+            Err(_) => {}
+        },
+        Op::Chmod { path, exec } => {
+            if is_regular(&root.join(path)) {
+                let mode = if exec { 0o755 } else { 0o644 };
+                fs::set_permissions(root.join(path), fs::Permissions::from_mode(mode)).unwrap();
+            }
+        }
+        Op::Symlink { path, target } => {
+            clear_for(root, path);
+            symlink(target, root.join(path)).unwrap();
+        }
+        Op::Rename { from, to } => {
+            let nested = |a: &str, b: &str| b.starts_with(&format!("{a}/"));
+            if from == to || nested(from, to) || nested(to, from) || fs::symlink_metadata(root.join(from)).map_or(true, |m| m.is_dir()) {
+                return;
+            }
+            clear_for(root, to);
+            fs::rename(root.join(from), root.join(to)).unwrap();
+        }
+    }
+}
+
+#[derive(Debug, PartialEq)]
+enum Node {
+    File { hash: String, mode: u32, mtime_ns: i64 },
+    Link(PathBuf),
+}
+
+/// Every file and symlink under `root` (directories are not synced as such).
+fn snapshot(root: &Path) -> BTreeMap<String, Node> {
+    fn walk(dir: &Path, prefix: &str, out: &mut BTreeMap<String, Node>) {
+        for e in fs::read_dir(dir).unwrap() {
+            let e = e.unwrap();
+            let name = e.file_name().into_string().unwrap();
+            let rel = if prefix.is_empty() { name } else { format!("{prefix}/{name}") };
+            let m = fs::symlink_metadata(e.path()).unwrap();
+            if m.is_dir() {
+                walk(&e.path(), &rel, out);
+            } else if m.file_type().is_symlink() {
+                out.insert(rel, Node::Link(fs::read_link(e.path()).unwrap()));
+            } else {
+                let hash = blake3::hash(&read(&e.path())).to_hex()[..16].to_string();
+                let mtime_ns = m.mtime() * 1_000_000_000 + m.mtime_nsec();
+                out.insert(
+                    rel,
+                    Node::File {
+                        hash,
+                        mode: m.mode() & 0o777,
+                        mtime_ns,
+                    },
+                );
+            }
+        }
+    }
+    let mut out = BTreeMap::new();
+    walk(root, "", &mut out);
+    out
+}
+
+proptest! {
+    #![proptest_config(sync_config())]
+
+    #[test]
+    fn a_push_leaves_the_remote_copy_identical_after_any_changes(rounds in rounds(PUSH_PATHS, true)) {
+        let s = Scratch::new();
+        let p = s.project("app", "");
+        let mut clock = 0;
+        for ops in &rounds {
+            for op in ops {
+                apply(&p.root, op, &mut clock);
+            }
+            let out = p.sub("push", &[]);
+            prop_assert!(out.status.success(), "{}", show(&out));
+            let mut local = snapshot(&p.root);
+            local.remove("mirako.toml");
+            prop_assert_eq!(&local, &snapshot(&p.remote), "after {:?}", ops);
+        }
+    }
+
+    #[test]
+    fn a_pull_brings_back_any_changes_of_the_host_and_deletes_nothing_here(rounds in rounds(PULL_PATHS, false)) {
+        let s = Scratch::new();
+        let p = s.project("app", "");
+        fs::create_dir_all(&p.remote).unwrap();
+        let mut clock = 0;
+        let mut before = snapshot(&p.root);
+        for ops in &rounds {
+            for op in ops {
+                apply(&p.remote, op, &mut clock);
+            }
+            let out = p.sub("pull", &[]);
+            prop_assert!(out.status.success(), "{}", show(&out));
+            let (remote, local) = (snapshot(&p.remote), snapshot(&p.root));
+            for (path, node) in &remote {
+                prop_assert_eq!(local.get(path), Some(node), "{} after {:?}", path, ops);
+            }
+            for (path, node) in before.iter().filter(|(path, _)| !remote.contains_key(*path)) {
+                prop_assert_eq!(local.get(path), Some(node), "{} kept after {:?}", path, ops);
+            }
+            before = local;
+        }
+    }
 }
