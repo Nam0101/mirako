@@ -30,6 +30,9 @@ enum Cmd {
         no_pull: bool,
         #[arg(long, short)]
         quiet: bool,
+        /// COMMAND is a Gradle build whose tests go to the IDE that started it (passed by the Gradle shim)
+        #[arg(long)]
+        test_events: bool,
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
         command: Vec<String>,
     },
@@ -156,9 +159,15 @@ fn real_main() -> Result<i32> {
             no_push,
             no_pull,
             quiet,
-            command,
+            test_events,
+            mut command,
         }) => {
-            let (root, cfg) = load(project.as_ref(), host.as_deref())?;
+            let (root, mut cfg) = load(project.as_ref(), host.as_deref())?;
+            if test_events {
+                // the init script that reports the tests goes up with the project, out of the excluded `.gradle`
+                command.extend(shim::test_events(&root)?);
+                cfg.exclude_local.push(format!("!/{}", shim::TEST_EVENTS));
+            }
             client::run(
                 &root,
                 &cfg,

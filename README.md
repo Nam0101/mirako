@@ -26,7 +26,7 @@ build outputs back. It is a single Rust binary, installed on both ends, in the s
   are untouched.
 - **Output paths rewritten.** Remote paths in the build log are replaced by local ones, so
   error links in the terminal and the IDE keep working.
-- **Android Studio support** through a 60-line Gradle init script that hands every build to
+- **Android Studio support** through a Gradle init script that hands every build to
   mirako (and silently builds locally when the host is down).
 
 ## Install
@@ -180,11 +180,24 @@ finishes.
   `adb install -r -t` here with the pulled APK (the one `build/outputs/apk/**/output-metadata.json`
   lists for that variant) on every attached device, or on the one `ANDROID_SERIAL` names. `adb`
   is the one under `sdk.dir` of `local.properties`, else under `ANDROID_HOME`, else on the `PATH`.
-  A variant with several APKs (splits) fails with a message: build that one with `-x mirako`
+  With no device to install on the build fails before anything is sent or built: `adb devices`
+  is asked first. A variant with several APKs (splits) fails with a message: build that one
+  with `-x mirako`
 - a build with any other `install…` task, or an `uninstall…`, `connected…` or `deviceCheck` one,
   runs locally: those talk to the device attached to this machine. Names are matched as typed,
   so an abbreviation (`iD`) goes to the host as it is. (Run in Android Studio is none of these:
   it assembles on the remote and deploys the pulled APK itself)
+- tests started in the IDE (the gutter icon, a test run configuration of IntelliJ or Android
+  Studio): from Gradle 8.3 on the IDE asks Gradle's test launcher for them, which looks the
+  test tasks up in the build it runs, so that build runs locally and says so. With the
+  registry key `gradle.testLauncherAPI.enabled` off (Find Action → `Registry…`) the IDE starts
+  them as tasks (`:app:testDebugUnitTest --tests …`), and those run on the remote: the script
+  calls `mirako run --test-events`, which puts `.gradle/mirako-test-events.gradle` into the
+  project, uploads it and loads it with `--init-script`. Under it every test task prints its suites, tests, results and output as the
+  `<ijLog>` lines the test console of the IDE reads from the build output, and always runs
+  (never `UP-TO-DATE`). That build takes `--no-configuration-cache`
+- a debug run of the IDE (tests or any other Gradle task) runs locally: its debugger attaches
+  to a JVM on this machine
 - one project always local: `mirako.enabled=false` in its `local.properties`
 - host unreachable: the build simply runs locally. The script asks `mirako check` first (one
   handshake, ~0.1 s); `shim_check = false` in the global config skips that, and a dead host then
