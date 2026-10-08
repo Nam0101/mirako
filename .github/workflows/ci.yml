@@ -27,6 +27,7 @@ jobs:
   check:
     name: fmt, clippy, test (macos-arm64)
     runs-on: [self-hosted, macOS, ARM64, m4]
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
@@ -45,11 +46,16 @@ jobs:
           - { name: linux-arm64, os: ubuntu-24.04-arm, target: aarch64-unknown-linux-musl }
           - { name: windows-x86_64, os: windows-latest, target: x86_64-pc-windows-msvc }
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - run: rustup update stable --no-self-update && rustup default stable && rustup target add ${{ matrix.target }} && rustup component add clippy
       - if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y musl-tools
+        # a stalled mirror once held `apt-get update` for 13 minutes: three tries of 90 s, and the
+        # package lists of the image do when none gets through
+        run: |
+          for try in 1 2 3; do sudo timeout 90 apt-get update && break; done
+          sudo timeout 300 apt-get install -y musl-tools
       - run: rustc --version && cargo --version
       - run: cargo clippy --all-targets --target ${{ matrix.target }} -- -D warnings
       # on Windows the unit tests only: tests/e2e.rs needs `sh` and a `HOME` sandbox
@@ -60,6 +66,7 @@ jobs:
     needs: check
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: [self-hosted, macOS, ARM64, m4]
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
@@ -86,6 +93,7 @@ jobs:
           - { name: linux-arm64, os: ubuntu-24.04-arm, target: aarch64-unknown-linux-musl }
           - { name: windows-x86_64, os: windows-latest, target: x86_64-pc-windows-msvc, exe: .exe }
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
     defaults:
       run:
         shell: bash
@@ -100,7 +108,11 @@ jobs:
       - if: runner.environment == 'github-hosted'
         run: rustup update stable --no-self-update && rustup default stable && rustup target add ${{ matrix.target }}
       - if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y musl-tools
+        # a stalled mirror once held `apt-get update` for 13 minutes: three tries of 90 s, and the
+        # package lists of the image do when none gets through
+        run: |
+          for try in 1 2 3; do sudo timeout 90 apt-get update && break; done
+          sudo timeout 300 apt-get install -y musl-tools
       - run: cargo build --release --target ${{ matrix.target }}
         env:
           # read for that target only: the .exe runs without the Visual C++ runtime installed
@@ -118,6 +130,7 @@ jobs:
     needs: build
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
       contents: write
     steps:

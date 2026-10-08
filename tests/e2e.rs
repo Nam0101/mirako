@@ -461,11 +461,9 @@ fn gc_days_writes_the_gradle_retention_script_on_the_host() {
     assert!(!script.exists());
 }
 
-/// README: the script is "removed again with `gc_days = 0`" after each run. But `client::run` only
-/// sends `Req::Gc` when `gc_days > 0` or `gc_after_pull` is set, so a run with `gc_days = 0` never
-/// reaches `gc::gradle_retention(…, 0)`; only `mirako gc` removes the file.
+/// README: the script is "removed again with `gc_days = 0`": the `Gc` request still rides behind
+/// the `Pull` of such a run, and nothing else in it applies.
 #[test]
-#[ignore = "suspected bug: a run with gc_days = 0 leaves ~/.gradle/init.d/mirako-gc.gradle behind (src/client.rs, `if cfg.gc_days > 0 || …`)"]
 fn a_run_with_gc_days_0_removes_the_gradle_retention_script() {
     let s = Scratch::new();
     fs::create_dir_all(s.gradle_home()).unwrap();
