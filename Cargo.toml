@@ -1,6 +1,6 @@
 [package]
 name = "mirako"
-version = "0.6.1"
+version = "0.7.0"
 edition = "2021"
 rust-version = "1.99"
 description = "Remote builds: sync the project to another machine over ssh (content-hash delta, zstd), run the command there, pull the outputs back."
@@ -36,6 +36,7 @@ strip = true
 
 [dev-dependencies]
 criterion = { version = "0.8.2", default-features = false }
+proptest = { version = "1.11.0", default-features = false, features = ["std"] }
 tempfile = "3.27.0"
 
 [[bench]]

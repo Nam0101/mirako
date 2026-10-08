@@ -106,7 +106,7 @@ pub fn serve() -> Result<()> {
             hangup.stop();
         }
     });
-    let mut inbox = Inbox::default();
+    let mut inbox = Inbox::mirror();
     let mut index: Option<(PathBuf, Index)> = None;
     let mut failed_deltas: Vec<String> = Vec::new();
     // an `Ack` reported failed deltas: the client resends them, so refuse to run anything until
@@ -121,6 +121,24 @@ pub fn serve() -> Result<()> {
             // and so it did, with requests read ahead: nobody waits for their answers, and its next
             // run may be at work in this tree already
             return Ok(());
+        }
+        // the pool writes of a push end before anything else is served: a `Flush` saves the index
+        // they update, an `Exec` builds the files they write. A failed one is this request's reply.
+        if !matches!(req, Req::Put(_)) {
+            match inbox.settle() {
+                Ok(written) => {
+                    if let Some((_, idx)) = index.as_mut() {
+                        for f in written {
+                            idx.remember(&f.path, f.size, f.mtime_ns, f.hash);
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("mirako serve: {e:#}");
+                    send(&out, &Resp::Error { msg: format!("{e:#}") })?;
+                    continue;
+                }
+            }
         }
         let result: Result<()> = (|| match req {
             Req::Hello { version } => {
@@ -154,7 +172,7 @@ pub fn serve() -> Result<()> {
             }
             Req::Put(chunk) => {
                 let (root, idx) = index.as_mut().context("Put before Manifest")?;
-                if let Some(f) = inbox.put(root, &chunk)? {
+                if let Some(f) = inbox.put(root, chunk)? {
                     idx.remember(&f.path, f.size, f.mtime_ns, f.hash);
                 }
                 Ok(())

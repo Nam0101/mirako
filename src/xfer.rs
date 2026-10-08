@@ -2,7 +2,9 @@
 //! whole-file chunks and delta chunks land in a temp file next to the destination and are
 //! renamed into place when complete, so a broken connection never leaves a half-written file.
 //! Nothing is fsync'ed: that costs ~4 ms per file on macOS and the next sync repairs whatever a
-//! power cut might lose.
+//! power cut might lose. A file that comes in one chunk (any under `CHUNK`) is written on a pool
+//! of `WRITERS` threads while the next frames are read: its handful of syscalls is the whole
+//! cost, and one thread gets through ~4 500 files a second.
 
 use crate::delta;
 use crate::proto::{self, Chunk, DeltaChunk};
@@ -12,6 +14,25 @@ use std::collections::HashMap;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::{mpsc, LazyLock};
+
+/// Threads writing one-chunk files. Creating and renaming files contends in the kernel: a cold
+/// push of 50 000 small files to APFS took 11.2 s written inline, 6.0 s with 2 writers, 6.3–6.8 s
+/// with 3, 6.8–7.4 s with 4 and 9.6 s with 10.
+const WRITERS: usize = 2;
+
+static WRITER_POOL: LazyLock<rayon::ThreadPool> = LazyLock::new(|| {
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(WRITERS)
+        .thread_name(|i| format!("mirako-write-{i}"))
+        .build()
+        .expect("writer threads")
+});
+
+/// Compressed bytes the pool may hold at once (a job counts at least `JOB_COST`), so a stream of
+/// files arriving faster than they are written waits instead of piling up in memory.
+const IN_FLIGHT: usize = 32 << 20;
+const JOB_COST: usize = 4096;
 
 pub fn safe_join(root: &Path, rel: &str) -> Result<PathBuf> {
     // on Windows `\` separates as well and `C:` starts the path over; no file name there holds either
@@ -49,19 +70,32 @@ fn set_mode(_: &Path, _: u32) -> io::Result<()> {
     Ok(())
 }
 
+/// `make` at `dest`, made again after removing the directory in its way when `replace_dir`: a
+/// push mirrors, and a directory turned into a file or a link here may stay behind on the host,
+/// empty or holding excluded files only, since the manifest names files and not directories.
+fn over_dir(dest: &Path, replace_dir: bool, make: impl Fn() -> io::Result<()>) -> io::Result<()> {
+    match make() {
+        Err(_) if replace_dir && fs::symlink_metadata(dest).is_ok_and(|m| m.is_dir()) => {
+            fs::remove_dir_all(dest)?;
+            make()
+        }
+        r => r,
+    }
+}
+
 #[cfg(unix)]
-fn make_symlink(target: &str, link: &Path) -> Result<()> {
+fn make_symlink(target: &str, link: &Path, replace_dir: bool) -> Result<()> {
     if let Some(parent) = link.parent() {
         fs::create_dir_all(parent)?;
     }
     let _ = fs::remove_file(link);
-    Ok(std::os::unix::fs::symlink(target, link)?)
+    Ok(over_dir(link, replace_dir, || std::os::unix::fs::symlink(target, link))?)
 }
 
 /// Windows gets no links, and what is at `link` stays: making one takes Developer Mode there,
 /// and its kind (file or directory) would depend on files that are still on their way.
 #[cfg(not(unix))]
-fn make_symlink(target: &str, link: &Path) -> Result<()> {
+fn make_symlink(target: &str, link: &Path, _: bool) -> Result<()> {
     bail!(
         "{} is a symlink to `{target}` on the other side: not made on Windows",
         link.display()
@@ -86,18 +120,96 @@ pub struct Finished {
     pub ok: bool,
 }
 
-#[derive(Default)]
+/// What a pool write sends back: the bytes it held against `IN_FLIGHT`, and how it went.
+type Written = (usize, Result<Finished>);
+
 pub struct Inbox {
     open: HashMap<String, Inbound>,
+    /// the agent's: see `mirror`
+    replace_dirs: bool,
+    tx: mpsc::Sender<Written>,
+    rx: mpsc::Receiver<Written>,
+    in_flight: usize,
+    done: Vec<Finished>,
+    error: Option<anyhow::Error>,
+}
+
+impl Default for Inbox {
+    fn default() -> Self {
+        let (tx, rx) = mpsc::channel();
+        Inbox {
+            open: HashMap::new(),
+            replace_dirs: false,
+            tx,
+            rx,
+            in_flight: 0,
+            done: Vec::new(),
+            error: None,
+        }
+    }
+}
+
+fn tmp_path(dest: &Path) -> PathBuf {
+    dest.with_file_name(format!(".mirako.{}.tmp", dest.file_name().unwrap_or_default().to_string_lossy()))
+}
+
+/// Moves a complete `tmp` over `dest` with its mode and mtime; returns the mtime a later scan
+/// reads back.
+fn install(tmp: &Path, dest: &Path, mode: u32, mtime_ns: i64, replace_dir: bool) -> Result<i64> {
+    set_mode(tmp, mode)?;
+    let _ = fs::remove_file(dest);
+    over_dir(dest, replace_dir, || fs::rename(tmp, dest))?;
+    // NTFS keeps 100 ns: report the mtime a later scan reads back, or its cache entry never hits
+    let mtime_ns = if cfg!(windows) {
+        mtime_ns - mtime_ns.rem_euclid(100)
+    } else {
+        mtime_ns
+    };
+    let ft = FileTime::from_unix_time(mtime_ns.div_euclid(1_000_000_000), mtime_ns.rem_euclid(1_000_000_000) as u32);
+    filetime::set_file_mtime(dest, ft)?;
+    Ok(mtime_ns)
+}
+
+/// A file that came in one chunk, on a thread of the pool.
+fn write_whole(dest: &Path, c: Chunk, replace_dir: bool) -> Result<Finished> {
+    let written = (|| -> Result<(u64, [u8; 32], i64)> {
+        if let Some(parent) = dest.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let data = proto::decompress(&c.data)?;
+        let tmp = tmp_path(dest);
+        fs::write(&tmp, &data)?;
+        let mtime_ns = install(&tmp, dest, c.mode, c.mtime_ns, replace_dir)?;
+        Ok((data.len() as u64, *blake3::hash(&data).as_bytes(), mtime_ns))
+    })();
+    match written {
+        Ok((size, hash, mtime_ns)) => Ok(Finished {
+            path: c.path,
+            size,
+            mtime_ns,
+            hash,
+            ok: true,
+        }),
+        Err(e) => Err(e.context(format!("writing {}", c.path))),
+    }
 }
 
 impl Inbox {
+    /// The agent's inbox: a push mirrors, so a directory where a file or link goes is removed
+    /// (the client's pull never deletes anything, and reports it instead).
+    pub fn mirror() -> Self {
+        Inbox {
+            replace_dirs: true,
+            ..Self::default()
+        }
+    }
+
     fn start(&mut self, root: &Path, rel: &str, with_old: bool) -> Result<()> {
         let dest = safe_join(root, rel)?;
         if let Some(parent) = dest.parent() {
             fs::create_dir_all(parent)?;
         }
-        let tmp = dest.with_file_name(format!(".mirako.{}.tmp", dest.file_name().unwrap_or_default().to_string_lossy()));
+        let tmp = tmp_path(&dest);
         let file = fs::File::create(&tmp)?;
         let old = if with_old {
             let f = fs::File::open(&dest).with_context(|| format!("old copy of {rel} missing for delta"))?;
@@ -138,17 +250,7 @@ impl Inbox {
                 });
             }
         }
-        set_mode(&tmp, mode)?;
-        let _ = fs::remove_file(&dest);
-        fs::rename(&tmp, &dest)?;
-        // NTFS keeps 100 ns: report the mtime a later scan reads back, or its cache entry never hits
-        let mtime_ns = if cfg!(windows) {
-            mtime_ns - mtime_ns.rem_euclid(100)
-        } else {
-            mtime_ns
-        };
-        let ft = FileTime::from_unix_time(mtime_ns.div_euclid(1_000_000_000), mtime_ns.rem_euclid(1_000_000_000) as u32);
-        filetime::set_file_mtime(&dest, ft)?;
+        let mtime_ns = install(&tmp, &dest, mode, mtime_ns, self.replace_dirs)?;
         Ok(Finished {
             path: rel.into(),
             size,
@@ -158,7 +260,14 @@ impl Inbox {
         })
     }
 
-    pub fn put(&mut self, root: &Path, c: &Chunk) -> Result<Option<Finished>> {
+    /// A file in one chunk goes to the pool and comes back from `settle`; the last chunk of a
+    /// longer one finishes it here.
+    pub fn put(&mut self, root: &Path, c: Chunk) -> Result<Option<Finished>> {
+        if c.offset == 0 && c.last {
+            let dest = safe_join(root, &c.path)?;
+            self.spawn_write(dest, c);
+            return Ok(None);
+        }
         if c.offset == 0 {
             self.start(root, &c.path, false)?;
         }
@@ -189,7 +298,46 @@ impl Inbox {
     }
 
     pub fn symlink(&mut self, root: &Path, rel: &str, target: &str) -> Result<()> {
-        make_symlink(target, &safe_join(root, rel)?)
+        make_symlink(target, &safe_join(root, rel)?, self.replace_dirs)
+    }
+
+    /// Waits for the pool writes and returns the files they finished; the first write that
+    /// failed is the error, and the others go unreported (a later scan hashes them again).
+    pub fn settle(&mut self) -> Result<Vec<Finished>> {
+        while self.in_flight > 0 {
+            self.take_one();
+        }
+        let done = std::mem::take(&mut self.done);
+        match self.error.take() {
+            Some(e) => Err(e),
+            None => Ok(done),
+        }
+    }
+
+    fn spawn_write(&mut self, dest: PathBuf, c: Chunk) {
+        let cost = c.data.len().max(JOB_COST);
+        while self.in_flight > 0 && self.in_flight + cost > IN_FLIGHT {
+            self.take_one();
+        }
+        let tx = self.tx.clone();
+        let replace_dir = self.replace_dirs;
+        self.in_flight += cost;
+        WRITER_POOL.spawn(move || {
+            // the receiver is gone only when the transfer was abandoned
+            let _ = tx.send((cost, write_whole(&dest, c, replace_dir)));
+        });
+    }
+
+    fn take_one(&mut self) {
+        // `self.tx` keeps the channel open, and every job sends once
+        let (cost, r) = self.rx.recv().expect("pool write lost");
+        self.in_flight -= cost;
+        match r {
+            Ok(f) => self.done.push(f),
+            Err(e) => {
+                self.error.get_or_insert(e);
+            }
+        }
     }
 }
 
@@ -276,7 +424,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = canonical(dir.path()).unwrap();
         assert!(!root.to_string_lossy().starts_with(r"\\?\"), "{}", root.display());
-        Inbox::default().put(&root, &chunk("a/b/f", 0, true, b"x", 1)).unwrap();
+        let mut inbox = Inbox::default();
+        inbox.put(&root, chunk("a/b/f", 0, true, b"x", 1)).unwrap();
+        inbox.settle().unwrap();
         assert_eq!(fs::read(dir.path().join("a").join("b").join("f")).unwrap(), b"x");
         assert!(canonical(&root.join("missing")).is_err());
     }
@@ -289,13 +439,41 @@ mod tests {
         let (a, b) = data.split_at(4_000);
         let mut inbox = Inbox::default();
 
-        let first = inbox.put(root, &chunk("x/y/f.bin", 0, false, a, data.len() as u64)).unwrap();
+        let first = inbox.put(root, chunk("x/y/f.bin", 0, false, a, data.len() as u64)).unwrap();
         assert!(first.is_none());
         let done = inbox
-            .put(root, &chunk("x/y/f.bin", a.len() as u64, true, b, data.len() as u64))
+            .put(root, chunk("x/y/f.bin", a.len() as u64, true, b, data.len() as u64))
             .unwrap()
             .expect("finished on the last chunk");
 
+        assert!(done.ok);
+        assert_eq!(done.path, "x/y/f.bin");
+        assert_eq!(done.size, data.len() as u64);
+        assert_eq!(done.mtime_ns, MTIME);
+        assert_eq!(done.hash, *blake3::hash(&data).as_bytes());
+        let dest = root.join("x/y/f.bin");
+        assert_eq!(fs::read(&dest).unwrap(), data);
+        let md = fs::metadata(&dest).unwrap();
+        assert_eq!(index::mode(&md), if cfg!(unix) { 0o640 } else { 0o755 });
+        assert_eq!(index::mtime_ns(&md), MTIME);
+        assert!(tmp_files(&root.join("x/y")).is_empty());
+    }
+
+    /// A file in one chunk, written by the pool.
+    fn put_whole(root: &Path, c: Chunk) -> Finished {
+        let mut inbox = Inbox::default();
+        assert!(inbox.put(root, c).unwrap().is_none(), "finished before `settle`");
+        let mut done = inbox.settle().unwrap();
+        assert_eq!(done.len(), 1);
+        done.pop().unwrap()
+    }
+
+    #[test]
+    fn put_in_one_chunk_writes_the_file_with_mode_and_mtime() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let data = noise(10_000, 4);
+        let done = put_whole(root, chunk("x/y/f.bin", 0, true, &data, data.len() as u64));
         assert!(done.ok);
         assert_eq!(done.path, "x/y/f.bin");
         assert_eq!(done.size, data.len() as u64);
@@ -314,8 +492,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         fs::write(root.join("f"), b"a much longer old content").unwrap();
-        let done = Inbox::default().put(root, &chunk("f", 0, true, b"new", 3)).unwrap().unwrap();
-        assert!(done.ok);
+        assert!(put_whole(root, chunk("f", 0, true, b"new", 3)).ok);
         assert_eq!(fs::read(root.join("f")).unwrap(), b"new");
         assert!(tmp_files(root).is_empty());
     }
@@ -324,7 +501,7 @@ mod tests {
     fn put_of_an_empty_file_creates_it() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        let done = Inbox::default().put(root, &chunk("empty", 0, true, b"", 0)).unwrap().unwrap();
+        let done = put_whole(root, chunk("empty", 0, true, b"", 0));
         assert!(done.ok);
         assert_eq!(done.size, 0);
         assert_eq!(done.hash, *blake3::hash(b"").as_bytes());
@@ -332,9 +509,27 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_pool_write_is_the_error_of_settle_after_the_others_finish() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("blocker"), b"a file, not a directory").unwrap();
+        let mut inbox = Inbox::default();
+        inbox.put(root, chunk("blocker/f", 0, true, b"x", 1)).unwrap();
+        for i in 0..50 {
+            inbox.put(root, chunk(&format!("ok/{i}"), 0, true, b"y", 1)).unwrap();
+        }
+        let err = format!("{:#}", inbox.settle().err().unwrap());
+        assert!(err.contains("writing blocker/f"), "{err}");
+        assert!((0..50).all(|i| root.join(format!("ok/{i}")).exists()));
+        // nothing left in flight: the inbox takes the next stream
+        inbox.put(root, chunk("next", 0, true, b"z", 1)).unwrap();
+        assert_eq!(inbox.settle().unwrap().len(), 1);
+    }
+
+    #[test]
     fn a_chunk_without_a_start_is_an_error() {
         let dir = tempfile::tempdir().unwrap();
-        let err = Inbox::default().put(dir.path(), &chunk("f", 10, true, b"x", 11)).err().unwrap();
+        let err = Inbox::default().put(dir.path(), chunk("f", 10, true, b"x", 11)).err().unwrap();
         assert!(err.to_string().contains("chunk without start"), "{err}");
         assert!(!dir.path().join("f").exists());
     }
@@ -342,7 +537,7 @@ mod tests {
     #[test]
     fn put_refuses_an_escaping_path() {
         let dir = tempfile::tempdir().unwrap();
-        assert!(Inbox::default().put(dir.path(), &chunk("../f", 0, true, b"x", 1)).is_err());
+        assert!(Inbox::default().put(dir.path(), chunk("../f", 0, true, b"x", 1)).is_err());
     }
 
     #[test]

@@ -1,20 +1,11 @@
-//! The exclude matcher on the paths of a large Android project, with the default lists plus the
-//! sample `exclude_remote_extra` (includes inside excluded dirs, the expensive shape).
+//! The exclude matcher on the paths of a large Android project, with the default lists (their
+//! includes inside excluded dirs are the expensive shape).
 
 use criterion::{criterion_group, criterion_main, Criterion, Throughput};
 use mirako::config::{DEFAULT_EXCLUDE_COMMON, DEFAULT_EXCLUDE_LOCAL, DEFAULT_EXCLUDE_REMOTE};
 use mirako::patterns::Matcher;
 use std::hint::black_box;
 use std::time::Duration;
-
-const SAMPLE_REMOTE_EXTRA: &[&str] = &[
-    "build/intermediates",
-    "!build/intermediates/apk_ide_redirect_file",
-    "!build/intermediates/apk",
-    "build/tmp",
-    "build/kotlin",
-    "build/kspCaches",
-];
 
 fn paths(n: usize) -> Vec<String> {
     let shapes: &[&dyn Fn(usize) -> String] = &[
@@ -33,12 +24,11 @@ fn paths(n: usize) -> Vec<String> {
 }
 
 fn benches(c: &mut Criterion) {
-    let mut patterns: Vec<String> = DEFAULT_EXCLUDE_REMOTE
+    let patterns: Vec<String> = DEFAULT_EXCLUDE_REMOTE
         .iter()
         .chain(DEFAULT_EXCLUDE_COMMON)
         .map(|s| s.to_string())
         .collect();
-    patterns.extend(SAMPLE_REMOTE_EXTRA.iter().map(|s| s.to_string()));
     let local: Vec<String> = DEFAULT_EXCLUDE_LOCAL
         .iter()
         .chain(DEFAULT_EXCLUDE_COMMON)
