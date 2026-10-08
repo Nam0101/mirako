@@ -195,13 +195,24 @@ fn line<'a>(out: &'a str, prefix: &str) -> &'a str {
         .unwrap_or_else(|| panic!("no `{prefix}` line in\n{out}"))
 }
 
-/// `push   {files} files ({deltas} as delta), {bytes} → {wire} on the wire, …` → (files, deltas, wire)
+/// `push   {files} files ({deltas} as delta), {bytes} ({wire} on the wire), …` → (files, deltas, wire);
+/// a line that names no files (`push   up to date, …`) counts none
 fn counts(l: &str) -> (usize, usize, String) {
     let w: Vec<&str> = l.split_whitespace().collect();
-    assert_eq!(w[2], "files", "{l}");
-    let deltas = w[3].trim_start_matches('(').parse().unwrap();
-    let arrow = w.iter().position(|s| *s == "→").unwrap_or_else(|| panic!("{l}"));
-    (w[1].parse().unwrap(), deltas, format!("{} {}", w[arrow + 1], w[arrow + 2]))
+    if !w[2].starts_with("file") {
+        return (0, 0, String::new());
+    }
+    let deltas = if w[4] == "as" {
+        w[3].trim_start_matches('(').parse().unwrap()
+    } else {
+        0
+    };
+    let on = w.iter().position(|s| *s == "on").unwrap_or_else(|| panic!("{l}"));
+    (
+        w[1].parse().unwrap(),
+        deltas,
+        format!("{} {}", w[on - 2].trim_start_matches('('), w[on - 1]),
+    )
 }
 
 #[test]
@@ -250,10 +261,8 @@ fn warm_run_sends_nothing() {
     p.run_ok(&[], &["sh", "-c", "mkdir -p build && cp src/a.txt build/a.out"]);
 
     let out = p.run_ok(&[], &["true"]);
-    let push = line(&out, "push");
-    assert_eq!(counts(push).0, 0, "{out}");
-    assert!(push.contains(", 0 deleted"), "{out}");
-    assert_eq!(counts(line(&out, "pull")).0, 0, "{out}");
+    assert!(line(&out, "push").starts_with("push   up to date, "), "{out}");
+    assert!(line(&out, "pull").starts_with("pull   up to date, "), "{out}");
 }
 
 #[test]
