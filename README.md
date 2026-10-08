@@ -33,7 +33,7 @@ build outputs back. It is a single Rust binary, installed on both ends, in the s
 
 Every [release](https://github.com/Nam0101/mirako/releases) has binaries for macOS (arm64),
 Linux (x86_64 and arm64, static) and Windows (x86_64): put the one for your machine on `PATH`
-as `mirako`. Or build it:
+as `mirako`. Or build it (Rust 1.99 or later):
 
 ```
 cargo install --git https://github.com/Nam0101/mirako
@@ -51,7 +51,7 @@ the agent's non-interactive shell on the host sees (java, `ANDROID_HOME`, free d
 warning for each missing piece, writes the Gradle init script, and handshakes, which puts this
 binary on the host as `~/.local/bin/mirako` (`remote_bin`). A host with another OS or
 architecture gets the agent built there instead, by its own cargo from this version's release
-tag (`cargo install --git … --tag v<version>`, a few minutes), so Rust must be installed on it.
+tag (`cargo install --git … --tag v<version>`, a few minutes), so it needs Rust 1.99 or later.
 From then on the client keeps both in step: a handshake that finds no agent, or one of another
 version, installs it the same way and retries, and `mirako run` rewrites the Gradle init script
 when it is out of date, so after a `cargo install` nothing else is needed. The pieces on their
