@@ -544,6 +544,39 @@ fn local_properties_goes_up_without_its_machine_paths_and_never_comes_back() {
     assert_eq!(counts(line(&out, "pull")).0, 0, "{out}");
 }
 
+/// What the Gradle shim passes for a test run of the IDE: the init script that reports the tests is
+/// written into the project, goes up although `.gradle` does not, and the command gets the flags that load it.
+#[test]
+fn test_events_uploads_the_init_script_and_passes_it_to_the_command() {
+    let s = Scratch::new();
+    let common = "exclude_common = [\".gradle\", \".git\", \"mirako.toml\"]";
+    let p = s.project("app", common);
+    p.write("src/a.txt", b"alpha\n");
+    p.write(".gradle/9.8/fileHashes.bin", b"state of the local Gradle");
+    // the appended flags are `$2…` of this script
+    let cmd = ["sh", "-c", "echo \"args=$*\"; head -1 \"$3\"", "gradlew", ":app:test"];
+    let args = "args=:app:test --init-script .gradle/mirako-test-events.gradle --no-configuration-cache";
+    let first = "// .gradle/mirako-test-events.gradle";
+
+    let out = p.run_ok(&["--test-events"], &cmd);
+    assert!(out.lines().any(|l| l == args), "{out}");
+    assert!(out.lines().any(|l| l.starts_with(first)), "{out}");
+    let script = read(&p.root.join(".gradle/mirako-test-events.gradle"));
+    assert!(script.starts_with(first.as_bytes()));
+    assert_eq!(read(&p.remote.join(".gradle/mirako-test-events.gradle")), script);
+    assert!(!p.remote.join(".gradle/9.8").exists(), "the rest of .gradle went up");
+
+    // the script is sent once
+    let out = p.run_ok(&["--test-events"], &cmd);
+    assert_eq!(counts(line(&out, "push")).0, 0, "{out}");
+
+    // a run that falls back finds it in the project itself
+    p.config(&format!("{common}\nssh = [\"sh\", \"-c\", \"exit 1\"]\nfallback = true"));
+    let out = p.run_ok(&["--test-events"], &cmd);
+    assert!(out.lines().any(|l| l == args), "{out}");
+    assert!(out.lines().any(|l| l.starts_with(first)), "{out}");
+}
+
 #[test]
 fn only_the_variables_the_env_key_names_reach_the_remote_command() {
     let s = Scratch::new();

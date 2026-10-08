@@ -33,6 +33,13 @@ if (localProps.exists() && localProps.text.contains("mirako.enabled=false")) ret
 def installs = sp.taskNames.findAll { it ==~ /(.*:)?install([A-Z]\w*)?(Debug|Release)(AndroidTest)?/ }
 def deviceTask = sp.taskNames.find { !(it in installs) && it ==~ /(.*:)?((install|uninstall|connected)[A-Z]\w*|deviceCheck)/ }
 if (deviceTask != null) { println("mirako: $deviceTask may need a device attached to this machine, building locally"); return }
+// a test run of the IDE (IntelliJ, Android Studio) shows in the init scripts it passes: `ijTestLogger…` for its test console,
+// and `ijTestInit…` when the tests go as tasks (`:app:testDebugUnitTest --tests …`). Without the second one it asked Gradle's
+// test launcher for them (its default from Gradle 8.3 on), which looks the test tasks up in the build it runs: that build
+// stays local. So does a debug run, whose debugger waits for a JVM of this machine.
+def ideTests = sp.initScripts.any { it.name.startsWith("ijTestLogger") }
+if (ideTests && !sp.initScripts.any { it.name.startsWith("ijTestInit") }) { println("mirako: the IDE asks Gradle's test launcher for these tests, and that needs the project itself: building locally (with the IDE registry key gradle.testLauncherAPI.enabled off they run on the host)"); return }
+if (sp.systemPropertiesArgs.containsKey("idea.debugger.dispatch.addr")) { println("mirako: the debugger of the IDE attaches to a JVM on this machine, building locally"); return }
 
 def bin = System.getenv("MIRAKO_BIN") ?: "__BIN__"
 if (!new File(bin).canExecute()) { println("mirako: binary not found at $bin, building locally"); return }
@@ -67,6 +74,26 @@ switch (sp.consoleOutput.toString()) {
     case "Rich":  args += ["--console", "rich"]; break
 }
 
+def run = { List<String> cmd ->
+    def proc = new ProcessBuilder(cmd).redirectErrorStream(true).start()
+    def out = proc.inputStream.text
+    [proc.waitFor(), out]
+}
+def adbPath = {
+    def sdk = new Properties()
+    if (localProps.exists()) localProps.withInputStream { sdk.load(it) }
+    def home = sdk.getProperty("sdk.dir") ?: System.getenv("ANDROID_HOME") ?: System.getenv("ANDROID_SDK_ROOT")
+    home ? new File(home, "platform-tools/adb").path : "adb"
+}
+// the devices an install goes to: `ANDROID_SERIAL`, or every one attached. None fails the build, and before the remote
+// one starts (doFirst of the task below) rather than after it
+def attached = { String adb ->
+    def listed = run([adb, "devices"])[1]
+    def devices = System.getenv("ANDROID_SERIAL") ? [System.getenv("ANDROID_SERIAL")] : listed.readLines().findAll { it.endsWith("\tdevice") }.collect { it.split("\t")[0] }
+    if (devices.isEmpty()) throw new GradleException("mirako: no device to install on:\n$listed")
+    devices
+}
+
 // `adb install`, on every device attached, of the APK that `assemble<Variant>` left under build/outputs/apk and the pull brought here
 def adbInstall = { String task ->
     def name = task.tokenize(":").last().substring("install".length())
@@ -84,19 +111,8 @@ def adbInstall = { String task ->
         apks << new File(meta.parentFile, json.elements[0].outputFile)
     }
     if (apks.isEmpty()) throw new GradleException("mirako: no APK of variant $variant under $base (build/outputs/apk/**/output-metadata.json)")
-    def sdk = new Properties()
-    if (localProps.exists()) localProps.withInputStream { sdk.load(it) }
-    def home = sdk.getProperty("sdk.dir") ?: System.getenv("ANDROID_HOME") ?: System.getenv("ANDROID_SDK_ROOT")
-    def adb = home ? new File(home, "platform-tools/adb").path : "adb"
-    def run = { List<String> cmd ->
-        def proc = new ProcessBuilder(cmd).redirectErrorStream(true).start()
-        def out = proc.inputStream.text
-        [proc.waitFor(), out]
-    }
-    def listed = run([adb, "devices"])[1]
-    def devices = System.getenv("ANDROID_SERIAL") ? [System.getenv("ANDROID_SERIAL")] : listed.readLines().findAll { it.endsWith("\tdevice") }.collect { it.split("\t")[0] }
-    if (devices.isEmpty()) throw new GradleException("mirako: no device to install on:\n$listed")
-    devices.each { device ->
+    def adb = adbPath()
+    attached(adb).each { device ->
         apks.each { apk ->
             def (code, out) = run([adb, "-s", device, "install", "-r", "-t", apk.path])
             if (code != 0) throw new GradleException("mirako: adb install of ${apk.name} on $device failed:\n$out")
@@ -119,9 +135,11 @@ def projectRoot = root
 gradle.rootProject { p ->
     p.tasks.register("mirako", Exec) { t ->
         t.workingDir = projectRoot
-        t.commandLine([bin, "run", "--project", projectRoot.path, "--", "./gradlew"] + gradleArgs)
+        // `--test-events`: the tests run where the IDE cannot listen to them, so the build prints them the way its console reads them
+        t.commandLine([bin, "run", "--project", projectRoot.path] + (ideTests ? ["--test-events"] : []) + ["--", "./gradlew"] + gradleArgs)
         t.doNotTrackState("mirako is never up-to-date")
         t.notCompatibleWithConfigurationCache("a reused entry would replay the flags of an earlier invocation")
+        t.doFirst { if (installs) attached(adbPath()) }
         t.doLast { installs.each { adbInstall(it) } }
     }
 }
@@ -137,6 +155,58 @@ def check = gradle.services.get(org.gradle.api.provider.ProviderFactory).exec {
 if (check.result.get().exitValue != 0) { println("mirako: ${check.standardError.asText.get().trim()} — building locally"); return }"#;
 
 const NO_CHECK: &str = "// no handshake (shim_check = false): a dead host fails, or falls back, inside `mirako run`";
+
+/// Where `mirako run --test-events` keeps `TEST_EVENTS_SCRIPT`, relative to the project root: in
+/// `.gradle`, which no VCS tracks, and uploaded all the same (see `test_events`).
+pub const TEST_EVENTS: &str = ".gradle/mirako-test-events.gradle";
+
+/// The init script of a build whose tests the IDE wants to see. Public Gradle API only (run on Gradle 8.13 and 9.8).
+pub const TEST_EVENTS_SCRIPT: &str = r#"// .gradle/mirako-test-events.gradle — written by `mirako run --test-events`, which the Gradle shim passes for a test run of the IDE.
+// The tests of this build run where the IDE cannot listen to them: every test task reports them on stdout instead, one
+// `<ijLog>` line per event, the form the Gradle test console of IntelliJ and Android Studio reads out of the build output.
+import org.gradle.api.tasks.testing.AbstractTestTask
+import org.gradle.api.tasks.testing.TestDescriptor
+import org.gradle.api.tasks.testing.TestListener
+import org.gradle.api.tasks.testing.TestOutputListener
+import org.gradle.api.tasks.testing.TestResult
+import java.util.concurrent.atomic.AtomicLong
+
+def ids = Collections.synchronizedMap(new IdentityHashMap())
+def lastId = new AtomicLong()
+def idOf = { TestDescriptor d -> d == null ? "" : ids.computeIfAbsent(d) { lastId.incrementAndGet().toString() } }
+// an event is one line of XML: nothing below a space in an attribute, text as base64
+def attr = { v -> (v ?: "").toString().replaceAll(/[\x00-\x1f]/, " ").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace("'", "&apos;") }
+def text = { v -> "<![CDATA[" + Base64.encoder.encodeToString((v ?: "").toString().getBytes("UTF-8")) + "]]>" }
+def event = { String type, TestDescriptor d, String body ->
+    println("<ijLog><event type='$type'><test id='${idOf(d)}' parentId='${idOf(d.parent)}'>" +
+            "<descriptor name='${attr(d.name)}' displayName='${attr(d.displayName)}' className='${attr(d.className)}'/>$body</test></event></ijLog>")
+}
+def result = { TestResult r ->
+    def body = ""
+    if (r.resultType == TestResult.ResultType.FAILURE) {
+        def f = r.failures ? r.failures[0].details : null
+        def type = f == null ? "error" : f.expected != null || f.actual != null ? "comparison" : f.assertionFailure ? "assertionFailed" : "error"
+        body = "<errorMsg>${text(f?.message)}</errorMsg><exceptionName>${text(f?.className)}</exceptionName><stackTrace>${text(f?.stacktrace)}</stackTrace><failureType>$type</failureType>"
+        if (type == "comparison") body += "<expected>${text(f.expected)}</expected><actual>${text(f.actual)}</actual>"
+    }
+    "<result resultType='${r.resultType}' startTime='${r.startTime}' endTime='${r.endTime}'>$body</result>"
+}
+
+gradle.taskGraph.whenReady { graph ->
+    graph.allTasks.findAll { it instanceof AbstractTestTask }.each { task ->
+        task.outputs.upToDateWhen { false }   // the IDE asked for a run, not for the results of the last one
+        task.testLogging.showStandardStreams = false
+        println("<ijLog><event type='reportLocation' testReport='${attr(task.reports.html.entryPoint.path)}'/></ijLog>")
+        task.addTestListener([
+            beforeSuite: { d -> event("beforeSuite", d, "") },
+            afterSuite : { d, r -> event("afterSuite", d, result(r)) },
+            beforeTest : { d -> event("beforeTest", d, "") },
+            afterTest  : { d, r -> event("afterTest", d, result(r)) },
+        ] as TestListener)
+        task.addTestOutputListener({ d, e -> event("onOutput", d, "<event destination='${e.destination}'>${text(e.message)}</event>") } as TestOutputListener)
+    }
+}
+"#;
 
 pub fn init_script(bin: &str, check: bool) -> String {
     INIT_SCRIPT
@@ -188,6 +258,21 @@ fn refresh_file(path: &Path, bin: &str, check: bool) -> Result<bool> {
     }
     fs::write(path, want).with_context(|| format!("rewriting {}", path.display()))?;
     Ok(true)
+}
+
+/// `mirako run --test-events`: puts `TEST_EVENTS_SCRIPT` into the project, from where the push takes
+/// it to the host (and a local fallback finds it), and returns the Gradle arguments that load it.
+/// Without the configuration cache, an entry of which runs no init script and so reports no test.
+pub fn test_events(root: &Path) -> Result<Vec<String>> {
+    let path = root.join(TEST_EVENTS);
+    // written once: an unchanged file is neither hashed nor sent again
+    if fs::read_to_string(&path).ok().as_deref() != Some(TEST_EVENTS_SCRIPT) {
+        fs::create_dir_all(path.parent().unwrap())?;
+        fs::write(&path, TEST_EVENTS_SCRIPT).with_context(|| format!("writing {}", path.display()))?;
+    }
+    Ok(["--init-script", TEST_EVENTS, "--no-configuration-cache"]
+        .map(String::from)
+        .to_vec())
 }
 
 #[cfg(test)]
@@ -252,6 +337,8 @@ mod tests {
             "excludedTaskNames.remove(\"mirako\")",
             "contains(\"mirako.enabled=false\")",
             "!(it in installs) && it ==~ /(.*:)?((install|uninstall|connected)[A-Z]\\w*|deviceCheck)/",
+            "ideTests && !sp.initScripts.any { it.name.startsWith(\"ijTestInit\") }",
+            "containsKey(\"idea.debugger.dispatch.addr\")",
             "it.commandLine(bin, \"check\", \"--project\", root.path)",
             "check.result.get().exitValue != 0",
             "sp.dryRun",
@@ -264,7 +351,44 @@ mod tests {
     fn init_script_registers_one_mirako_exec_task_running_gradlew() {
         assert!(INIT_SCRIPT.contains("p.tasks.register(\"mirako\", Exec)"));
         assert!(INIT_SCRIPT.contains("sp.setTaskNames([\"mirako\"])"));
-        assert!(INIT_SCRIPT.contains("[bin, \"run\", \"--project\", projectRoot.path, \"--\", \"./gradlew\"]"));
+        assert!(INIT_SCRIPT.contains(
+            "[bin, \"run\", \"--project\", projectRoot.path] + (ideTests ? [\"--test-events\"] : []) + [\"--\", \"./gradlew\"] + gradleArgs"
+        ));
+    }
+
+    #[test]
+    fn init_script_asks_for_test_events_on_a_test_run_of_the_ide() {
+        // the names IntelliJ gives its init scripts: `ijTestLogger<n>.gradle`, `ijTestInit<n>.gradle`
+        assert!(INIT_SCRIPT.contains("def ideTests = sp.initScripts.any { it.name.startsWith(\"ijTestLogger\") }"));
+        // what its test console takes for an event: a line of the build output from `<ijLog>` to `</ijLog>`
+        assert_eq!(TEST_EVENTS_SCRIPT.matches("println(\"<ijLog><event type='").count(), 2);
+        assert_eq!(TEST_EVENTS_SCRIPT.matches("</ijLog>\")").count(), 2);
+        for kind in [
+            "'reportLocation'",
+            "\"beforeSuite\"",
+            "\"afterSuite\"",
+            "\"beforeTest\"",
+            "\"afterTest\"",
+            "\"onOutput\"",
+        ] {
+            assert!(TEST_EVENTS_SCRIPT.contains(kind), "missing {kind}");
+        }
+    }
+
+    #[test]
+    fn test_events_puts_the_script_into_the_project_and_returns_the_gradle_arguments() {
+        let dir = tempfile::tempdir().unwrap();
+        let args = test_events(dir.path()).unwrap();
+        assert_eq!(
+            args,
+            ["--init-script", ".gradle/mirako-test-events.gradle", "--no-configuration-cache"]
+        );
+        let path = dir.path().join(TEST_EVENTS);
+        assert_eq!(fs::read_to_string(&path).unwrap(), TEST_EVENTS_SCRIPT);
+        // the script of another version is replaced
+        fs::write(&path, "// old").unwrap();
+        test_events(dir.path()).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), TEST_EVENTS_SCRIPT);
     }
 
     #[test]
@@ -272,6 +396,8 @@ mod tests {
         // only a debug or release variant: `installDist`, `installGitHooks` are no Android installs
         assert!(INIT_SCRIPT.contains("it ==~ /(.*:)?install([A-Z]\\w*)?(Debug|Release)(AndroidTest)?/"));
         assert!(INIT_SCRIPT.contains("it.replaceFirst(/(^|:)install(?=[A-Z]\\w*$)/, '$1assemble')"));
+        // no device: known before the build, not after it
+        assert!(INIT_SCRIPT.contains("t.doFirst { if (installs) attached(adbPath()) }"));
         assert!(INIT_SCRIPT.contains("t.doLast { installs.each { adbInstall(it) } }"));
         assert!(INIT_SCRIPT.contains("[adb, \"-s\", device, \"install\", \"-r\", \"-t\", apk.path]"));
     }
