@@ -76,13 +76,71 @@ impl Hangup {
 }
 
 /// A job object: a command and the processes it starts from then on, all of which
-/// `TerminateJobObject` stops. Closing it leaves them running (no `KILL_ON_JOB_CLOSE`), so a build
-/// that ends leaves its Gradle daemon up for the next one.
+/// `TerminateJobObject` stops. While the command runs, closing the job kills them as well
+/// (`KILL_ON_JOB_CLOSE`), so an agent that dies takes its build along; `keep` lifts that once the
+/// command has ended, so a build that ends leaves its Gradle daemon up for the next one.
+///
+/// OpenSSH holds every process of a session in a job that kills them all when the session ends,
+/// the agent and a Gradle daemon alike. `spawn` starts the command outside it, which that job
+/// allows (`JOB_OBJECT_LIMIT_BREAKAWAY_OK`); where breakaway is refused the command stays inside,
+/// and its daemons end with the session.
 #[cfg(windows)]
 mod job {
+    use std::io;
     use std::os::windows::io::AsRawHandle;
-    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
-    use windows_sys::Win32::System::JobObjects::{AssignProcessToJobObject, CreateJobObjectW, TerminateJobObject};
+    use std::os::windows::process::CommandExt;
+    use std::process::{Child, Command};
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, GetHandleInformation, SetHandleInformation, ERROR_ACCESS_DENIED, HANDLE, HANDLE_FLAG_INHERIT,
+    };
+    use windows_sys::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation, SetInformationJobObject, TerminateJobObject,
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    };
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetProcessHandleCount, CREATE_BREAKAWAY_FROM_JOB, CREATE_NO_WINDOW};
+
+    /// The highest handle value `inherit_nothing` tries.
+    const MAX_HANDLE: usize = 1 << 20;
+
+    /// Makes every handle of this process uninheritable. The shell that started the agent passed
+    /// it its own, the pipes of the ssh session among them, and the session stays open while any
+    /// process holds one: a Gradle daemon a command started would hold the client until the daemon
+    /// exits. There is no list of handles to walk, so this tries the values handles take (multiples
+    /// of 4) until it has met as many as the process has. `serve` calls it before it starts a
+    /// thread: run while a `spawn` is under way, it could take the child's stdio away.
+    pub fn inherit_nothing() {
+        // SAFETY: queries and flags on handles of this process; a value that is no handle answers an error
+        unsafe {
+            let mut count = 0;
+            if GetProcessHandleCount(GetCurrentProcess(), &mut count) == 0 {
+                return;
+            }
+            let (mut seen, mut value) = (0, 4);
+            while seen < count && value <= MAX_HANDLE {
+                let mut flags = 0;
+                if GetHandleInformation(value as HANDLE, &mut flags) != 0 {
+                    seen += 1;
+                    if flags & HANDLE_FLAG_INHERIT != 0 {
+                        SetHandleInformation(value as HANDLE, HANDLE_FLAG_INHERIT, 0);
+                    }
+                }
+                value += 4;
+            }
+        }
+    }
+
+    /// Starts `command` with a console of its own that shows no window, whatever the agent has,
+    /// and outside the job of the agent when that job lets it go.
+    pub fn spawn(command: &mut Command) -> io::Result<Child> {
+        command.creation_flags(CREATE_NO_WINDOW | CREATE_BREAKAWAY_FROM_JOB);
+        match command.spawn() {
+            Err(e) if e.raw_os_error() == Some(ERROR_ACCESS_DENIED as i32) => {
+                command.creation_flags(CREATE_NO_WINDOW);
+                command.spawn()
+            }
+            r => r,
+        }
+    }
 
     pub struct Job(HANDLE);
 
@@ -90,10 +148,10 @@ mod job {
     unsafe impl Send for Job {}
 
     impl Job {
-        /// A job holding `child`, `None` when Windows refuses one (the command then runs to its end
-        /// on a hang-up). What `child` starts in the moment before it joins stays outside: nothing,
-        /// for a `cmd.exe` that has a batch file to read first.
-        pub fn new(child: &std::process::Child) -> Option<Self> {
+        /// A job holding `child` that kills what it holds when closed, `None` when Windows refuses
+        /// one (the command then runs to its end on a hang-up). What `child` starts in the moment
+        /// before it joins stays outside: nothing, for a `cmd.exe` that has a batch file to read first.
+        pub fn new(child: &Child) -> Option<Self> {
             // SAFETY: plain calls; the handle belongs to the `Job` from its creation on
             unsafe {
                 let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
@@ -101,7 +159,27 @@ mod job {
                     return None;
                 }
                 let job = Job(job);
+                job.kill_on_close(true);
                 (AssignProcessToJobObject(job.0, child.as_raw_handle() as HANDLE) != 0).then_some(job)
+            }
+        }
+
+        /// What is left in the job outlives it from now on: the daemons of a command that ended.
+        pub fn keep(&self) {
+            self.kill_on_close(false);
+        }
+
+        fn kill_on_close(&self, on: bool) {
+            // SAFETY: `self.0` is open until `drop`; the struct is plain data, zero but for the flags
+            unsafe {
+                let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+                info.BasicLimitInformation.LimitFlags = if on { JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE } else { 0 };
+                SetInformationJobObject(
+                    self.0,
+                    JobObjectExtendedLimitInformation,
+                    &info as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION as *const std::ffi::c_void,
+                    std::mem::size_of_val(&info) as u32,
+                );
             }
         }
 
@@ -189,6 +267,8 @@ fn windows_program(dir: &Path, prog: &str, path_var: Option<&OsStr>) -> OsString
 }
 
 pub fn serve() -> Result<()> {
+    #[cfg(windows)]
+    job::inherit_nothing();
     let out: Out = Arc::new(Mutex::new(BufWriter::new(io::stdout())));
     // requests are read on a thread of their own: the loop below is busy while a command runs,
     // and a client that closes the connection then (a cancelled build) has to stop that command
@@ -492,10 +572,11 @@ fn exec(out: &Out, hangup: &Arc<Hangup>, dir: &Path, cmd: &[String], env: Vec<(S
     // a process group of its own, so that a hang-up stops what the command started as well
     #[cfg(unix)]
     std::os::unix::process::CommandExt::process_group(&mut command, 0);
-    // a console of its own that shows no window, whatever the agent has
     #[cfg(windows)]
-    std::os::windows::process::CommandExt::creation_flags(&mut command, windows_sys::Win32::System::Threading::CREATE_NO_WINDOW);
-    let mut child = command.spawn().with_context(|| format!("starting `{prog}` in {}", dir.display()))?;
+    let child = job::spawn(&mut command);
+    #[cfg(unix)]
+    let child = command.spawn();
+    let mut child = child.with_context(|| format!("starting `{prog}` in {}", dir.display()))?;
     // and on Windows a job, before the group: a hang-up seeing the one finds the other
     #[cfg(windows)]
     {
@@ -546,8 +627,12 @@ fn exec(out: &Out, hangup: &Arc<Hangup>, dir: &Path, cmd: &[String], env: Vec<(S
     let _ = t2.join();
     hangup.group.store(0, Ordering::SeqCst);
     #[cfg(windows)]
-    {
-        *hangup.job.lock().unwrap() = None;
+    if let Some(job) = hangup.job.lock().unwrap().take() {
+        // a command that ended by itself leaves its daemons up; after a hang-up, closing the job
+        // takes them along
+        if !hangup.gone.load(Ordering::SeqCst) {
+            job.keep();
+        }
     }
     send(
         out,
@@ -614,6 +699,46 @@ mod tests {
         assert_eq!(find("echo"), OsString::from("echo"));
         assert_eq!(find("gradle.bat"), OsString::from("gradle.bat"));
         assert_eq!(windows_program(dir.path(), "gradle", None), OsString::from("gradle"));
+    }
+
+    /// Closing a job kills what it holds (an agent that dies mid-build), unless `keep` came first
+    /// (the daemons of a build that ended).
+    #[cfg(windows)]
+    #[test]
+    fn a_closed_job_kills_its_processes_unless_kept() {
+        let start = || {
+            let mut command = Command::new("ping");
+            command.args(["-n", "30", "127.0.0.1"]).stdout(Stdio::null());
+            job::spawn(&mut command).unwrap()
+        };
+        let (mut killed, mut kept) = (start(), start());
+        drop(job::Job::new(&killed).unwrap());
+        let job = job::Job::new(&kept).unwrap();
+        job.keep();
+        drop(job);
+        thread::sleep(Duration::from_millis(500));
+        assert!(killed.try_wait().unwrap().is_some(), "the closed job left its process running");
+        assert!(kept.try_wait().unwrap().is_none(), "the kept job's process was killed");
+        kept.kill().unwrap();
+    }
+
+    /// After `inherit_nothing` no handle the process had, stdio or other, reaches a child.
+    #[cfg(windows)]
+    #[test]
+    fn inherit_nothing_makes_every_handle_uninheritable() {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Foundation::{GetHandleInformation, SetHandleInformation, HANDLE, HANDLE_FLAG_INHERIT};
+        let file = tempfile::tempfile().unwrap();
+        let handles = [file.as_raw_handle() as HANDLE, io::stdout().as_raw_handle() as HANDLE];
+        // SAFETY: flags of handles this test holds open
+        unsafe { SetHandleInformation(handles[0], HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT) };
+        job::inherit_nothing();
+        for handle in handles {
+            let mut flags = 0;
+            // SAFETY: as above
+            assert_ne!(unsafe { GetHandleInformation(handle, &mut flags) }, 0, "no handle at {handle:?}");
+            assert_eq!(flags & HANDLE_FLAG_INHERIT, 0, "{handle:?} is still inheritable");
+        }
     }
 
     #[test]
