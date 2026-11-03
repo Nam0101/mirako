@@ -83,7 +83,7 @@ def adbPath = {
     def sdk = new Properties()
     if (localProps.exists()) localProps.withInputStream { sdk.load(it) }
     def home = sdk.getProperty("sdk.dir") ?: System.getenv("ANDROID_HOME") ?: System.getenv("ANDROID_SDK_ROOT")
-    home ? new File(home, "platform-tools/adb").path : "adb"
+    home ? new File(home, "platform-tools/" + (File.separator == "\\" ? "adb.exe" : "adb")).path : "adb"
 }
 // the devices an install goes to: `ANDROID_SERIAL`, or every one attached. None fails the build, and before the remote
 // one starts (doFirst of the task below) rather than after it
@@ -400,5 +400,7 @@ mod tests {
         assert!(INIT_SCRIPT.contains("t.doFirst { if (installs) attached(adbPath()) }"));
         assert!(INIT_SCRIPT.contains("t.doLast { installs.each { adbInstall(it) } }"));
         assert!(INIT_SCRIPT.contains("[adb, \"-s\", device, \"install\", \"-r\", \"-t\", apk.path]"));
+        // the SDK's adb on Windows is an .exe, which a path that names no extension does not find
+        assert!(INIT_SCRIPT.contains(r#""platform-tools/" + (File.separator == "\\" ? "adb.exe" : "adb")"#));
     }
 }

@@ -2,23 +2,73 @@
 //! so IDE error links and file paths keep pointing at this machine.
 
 pub struct LineRewriter {
-    from: Vec<u8>,
+    from: Vec<From>,
     to: Vec<u8>,
     /// `to` as it stands behind `file://`
     to_url: Vec<u8>,
     buf: Vec<u8>,
 }
 
+/// One spelling of the remote root.
+struct From {
+    bytes: Vec<u8>,
+    /// a Windows path written with `\` for a client whose paths have `/`: the rest of the path,
+    /// up to `TAIL_END`, gets `/` as well
+    slash_tail: bool,
+    /// starts with a drive (`C:`), which a URL writes as `file:///C:/…`
+    drive: bool,
+}
+
+/// Where a path in a line of build output ends: `A.kt:12:5`, `(A.kt)`, `'A.kt'`, `A.kt, B.kt`.
+const TAIL_END: &[u8] = b" \t\r\n:\"'()[]<>|,;";
+
 impl LineRewriter {
     pub fn new(from: &str, to: &str) -> Self {
+        Self::with(
+            vec![From {
+                bytes: from.as_bytes().to_vec(),
+                slash_tail: false,
+                drive: false,
+            }],
+            to,
+        )
+    }
+
+    /// The root of a Windows host (`C:\Users\b\mirako\app`), as its build prints it: with `\`,
+    /// and with `/` (`file:///C:/Users/b/…`, Gradle's own messages).
+    pub fn windows_host(root: &str, to: &str) -> Self {
+        let drive = root.as_bytes().get(1) == Some(&b':');
+        let slashed = root.replace('\\', "/");
+        Self::with(
+            vec![
+                From {
+                    bytes: root.as_bytes().to_vec(),
+                    slash_tail: !to.contains('\\'),
+                    drive,
+                },
+                From {
+                    bytes: slashed.into_bytes(),
+                    slash_tail: false,
+                    drive,
+                },
+            ],
+            to,
+        )
+    }
+
+    fn with(from: Vec<From>, to: &str) -> Self {
         // a Windows path is `/C:/…` in a URL: kotlinc prints `file:///C:/…`, the host `file:///Users/…`
         let to_url = if to.starts_with('/') {
             to.to_string()
         } else {
             format!("/{}", to.replace('\\', "/"))
         };
+        let from = from
+            .into_iter()
+            .filter(|f| !f.bytes.is_empty() && f.bytes != to.as_bytes())
+            .collect();
         Self {
-            from: from.as_bytes().to_vec(),
+            from,
             to: to.as_bytes().to_vec(),
             to_url: to_url.into_bytes(),
             buf: Vec::new(),
@@ -47,19 +97,30 @@ impl LineRewriter {
     }
 
     fn replace(&self, data: &[u8]) -> Vec<u8> {
-        if self.from.is_empty() || self.from == self.to {
+        if self.from.is_empty() {
             return data.to_vec();
         }
         let mut out = Vec::with_capacity(data.len());
         let mut i = 0;
         while i < data.len() {
-            if data[i..].starts_with(&self.from) {
-                let to = if out.ends_with(b"file://") { &self.to_url } else { &self.to };
-                out.extend_from_slice(to);
-                i += self.from.len();
-            } else {
+            let Some(f) = self.from.iter().find(|f| data[i..].starts_with(&f.bytes)) else {
                 out.push(data[i]);
                 i += 1;
+                continue;
+            };
+            if f.drive && out.ends_with(b"file:///") {
+                out.extend_from_slice(&self.to_url[1..]);
+            } else if out.ends_with(b"file://") {
+                out.extend_from_slice(&self.to_url);
+            } else {
+                out.extend_from_slice(&self.to);
+            }
+            i += f.bytes.len();
+            if f.slash_tail {
+                while i < data.len() && !TAIL_END.contains(&data[i]) {
+                    out.push(if data[i] == b'\\' { b'/' } else { data[i] });
+                    i += 1;
+                }
             }
         }
         out
@@ -167,6 +228,40 @@ mod tests {
         assert_eq!(
             all(&mut LineRewriter::new("/r", "/l"), &[b"file:///r/a /r/b\n"]),
             b"file:///l/a /l/b\n"
+        );
+    }
+
+    #[test]
+    fn the_paths_of_a_windows_host_become_slash_paths_here() {
+        let mut r = LineRewriter::windows_host(r"C:\Users\b\mirako\app", "/Users/me/app");
+        let out = all(
+            &mut r,
+            &[
+                b"C:\\Users\\b\\mirako\\app\\src\\A.java:7: error: x\r\n",
+                b"e: file:///C:/Users/b/mirako/app/src/B.kt:3:1 boom\n",
+                b"see C:/Users/b/mirako/app/build/reports/x.html and (C:\\Users\\b\\mirako\\app\\a\\b.txt)\n",
+                b"D:\\other\\x.txt is left alone\n",
+            ],
+        );
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "/Users/me/app/src/A.java:7: error: x\r\n\
+             e: file:///Users/me/app/src/B.kt:3:1 boom\n\
+             see /Users/me/app/build/reports/x.html and (/Users/me/app/a/b.txt)\n\
+             D:\\other\\x.txt is left alone\n"
+        );
+    }
+
+    #[test]
+    fn a_windows_host_and_a_windows_client_keep_their_backslashes() {
+        let mut r = LineRewriter::windows_host(r"C:\Users\b\mirako\app", r"D:\work\app");
+        let out = all(
+            &mut r,
+            &[b"C:\\Users\\b\\mirako\\app\\src\\A.java:7: e\nfile:///C:/Users/b/mirako/app/B.kt:1\n"],
+        );
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "D:\\work\\app\\src\\A.java:7: e\nfile:///D:/work/app/B.kt:1\n"
         );
     }
 

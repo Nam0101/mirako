@@ -196,10 +196,17 @@ fn free_space(p: &Path) -> u64 {
     st.f_bavail as u64 * st.f_frsize as u64
 }
 
-/// Unknown on Windows, which is a client: the builds, and so this housekeeping, run on a Unix host.
-#[cfg(not(unix))]
-fn free_space(_: &Path) -> u64 {
-    0
+#[cfg(windows)]
+fn free_space(p: &Path) -> u64 {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
+    let wide: Vec<u16> = p.as_os_str().encode_wide().chain(Some(0)).collect();
+    let mut free = 0u64;
+    // SAFETY: `wide` is NUL-terminated and `free` a valid out-parameter; the other two may be null
+    if unsafe { GetDiskFreeSpaceExW(wide.as_ptr(), &mut free, std::ptr::null_mut(), std::ptr::null_mut()) } == 0 {
+        return 0;
+    }
+    free
 }
 
 #[cfg(test)]
@@ -400,7 +407,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(unix)]
     fn free_space_is_positive_for_a_real_dir_and_zero_for_a_missing_one() {
         let (_d, t) = canon_tempdir();
         assert!(free_space(&t) > 0);

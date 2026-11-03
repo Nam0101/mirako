@@ -2,12 +2,13 @@
 
 use crate::config::Config;
 use crate::delta;
+use crate::host::{self, Shell, Source};
 use crate::index::{Index, Sigs};
 use crate::patterns::Matcher;
 use crate::progress::Progress;
 use crate::proto::{self, read_frame, write_frame, Chunk, DeltaChunk, Entry, GcReport, GcReq, Kind, Req, Resp, CHUNK};
 use crate::rewrite::LineRewriter;
-use crate::server::read_full;
+use crate::server::{program_in, read_full};
 use crate::shim;
 use crate::xfer::Inbox;
 use anyhow::{bail, Context, Result};
@@ -53,6 +54,11 @@ enum Attempt {
     Mute,
     /// the agent answered with this other version
     Version(String),
+    /// the remote command failed otherwise, with this exit code (255: ssh itself)
+    Failed {
+        code: Option<i32>,
+        error: anyhow::Error,
+    },
 }
 
 #[derive(Default)]
@@ -71,20 +77,39 @@ pub struct Stats {
 impl Session {
     /// Starts `mirako serve` over ssh and shakes hands. `first` goes out in the same write as
     /// the `Hello`, so the agent is already working on it while the reply crosses the link.
-    /// `ssh host 'mirako serve'` plus the handshake. When the agent is missing there, runs
-    /// another version or does not answer, this binary is installed as `remote_bin` and the
-    /// connection retried once.
+    /// `ssh host 'mirako serve'` plus the handshake, the command spelled for the shell the host
+    /// was last found to have (sh until a probe says otherwise: see `host`); one that fails gets
+    /// the host probed, and spelled again if its shell is another. When the agent is missing
+    /// there, runs another version or does not answer, this binary is installed as `remote_bin`
+    /// and the connection retried once.
     pub fn connect(cfg: &Config, first: Option<&Req>) -> Result<Self> {
-        let why = match Self::attempt(cfg, first)? {
+        let shell = host::known(cfg);
+        let mut attempt = Self::attempt(cfg, shell, first)?;
+        if let Attempt::Failed { code, .. } = attempt {
+            // ssh got through (255 is its own failure) and the command did not run: it may be
+            // spelled for another shell than the host's (a Windows host, the first time)
+            if code != Some(255) {
+                if let Ok(found) = host::probe(cfg) {
+                    if found.shell != shell {
+                        host::remember(cfg, found.shell);
+                        attempt = Self::attempt(cfg, found.shell, first)?;
+                    }
+                }
+            }
+        }
+        let why = match attempt {
             Attempt::Up(s) => return Ok(s),
+            Attempt::Failed { error, .. } => return Err(error),
             Attempt::Missing => format!("no `{}` on {}", cfg.remote_bin, cfg.host),
             Attempt::Mute => format!("`{}` on {} does not answer the handshake (0.4 or older)", cfg.remote_bin, cfg.host),
             Attempt::Version(v) => format!("remote mirako is {v}, local is {}", proto::VERSION),
         };
         eprintln!("mirako: {why}: installing mirako {} there", proto::VERSION);
         remote_install(cfg).with_context(|| format!("{why}; installing it failed, try `mirako remote-install`"))?;
-        match Self::attempt(cfg, first)? {
+        // the install probed the host's shell
+        match Self::attempt(cfg, host::known(cfg), first)? {
             Attempt::Up(s) => Ok(s),
+            Attempt::Failed { error, .. } => Err(error),
             Attempt::Missing => bail!("still no `{}` on {} right after installing it", cfg.remote_bin, cfg.host),
             Attempt::Mute => bail!(
                 "`{}` on {} still does not answer right after installing it",
@@ -95,9 +120,9 @@ impl Session {
         }
     }
 
-    fn attempt(cfg: &Config, first: Option<&Req>) -> Result<Attempt> {
+    fn attempt(cfg: &Config, shell: Shell, first: Option<&Req>) -> Result<Attempt> {
         let mut child = ssh(cfg)
-            .arg(format!("{} serve", cfg.remote_bin))
+            .arg(shell.serve(&cfg.remote_bin))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
@@ -121,18 +146,22 @@ impl Session {
         let hello = match handshake {
             Ok(hello) => hello,
             Err(e) => {
-                match child.wait().ok().and_then(|s| s.code()) {
+                let code = child.wait().ok().and_then(|s| s.code());
+                match code {
                     // the remote shell could not run `remote_bin`: 127 not found, 126 not executable
                     Some(126 | 127) => return Ok(Attempt::Missing),
                     // `serve` ends cleanly on a frame it cannot decode
                     Some(0) => return Ok(Attempt::Mute),
                     _ => {}
                 }
-                bail!(
-                    "no answer from `{} serve` on {} ({e}). Is the host reachable and mirako installed there? Try `mirako remote-install`.",
-                    cfg.remote_bin,
-                    cfg.host
-                );
+                return Ok(Attempt::Failed {
+                    code,
+                    error: anyhow::anyhow!(
+                        "no answer from `{} serve` on {} ({e}). Is the host reachable and mirako installed there? Try `mirako remote-install`.",
+                        cfg.remote_bin,
+                        cfg.host
+                    ),
+                });
             }
         };
         match hello {
@@ -155,6 +184,11 @@ impl Session {
             Resp::Error { msg } => bail!("remote: {msg}"),
             other => bail!("unexpected handshake reply {other:?}"),
         }
+    }
+
+    /// A Windows host has no permission bits, and says 0755 for every file it has.
+    fn host_modes(&self) -> bool {
+        !self.remote_os.starts_with("windows")
     }
 
     fn send(&mut self, req: &Req) -> Result<()> {
@@ -218,6 +252,7 @@ impl Session {
         };
         let remote_map: HashMap<&str, &Entry> = remote.iter().map(|e| (e.path.as_str(), e)).collect();
         let local_set: HashSet<&str> = local.iter().map(|e| e.path.as_str()).collect();
+        let modes = self.host_modes();
 
         let to_delete: Vec<String> = remote
             .iter()
@@ -227,7 +262,7 @@ impl Session {
         let to_send: Vec<&Entry> = local
             .iter()
             .filter(|e| match remote_map.get(e.path.as_str()) {
-                Some(r) => r.hash != e.hash || r.kind != e.kind || r.mode != e.mode,
+                Some(r) => r.hash != e.hash || r.kind != e.kind || (modes && r.mode != e.mode),
                 None => true,
             })
             .collect();
@@ -394,7 +429,12 @@ impl Session {
     /// Reads one stream of `Put`/`Delta`/`Symlink` frames up to its `End`, writing the files
     /// into `root`. Returns the paths whose delta rebuilt to the wrong hash.
     fn receive(&mut self, root: &Path, index: &mut Index, stats: &mut Stats) -> Result<Vec<String>> {
-        let mut inbox = Inbox::default();
+        // the modes of a host that has none (all 0755) are not this side's either
+        let mut inbox = if self.host_modes() {
+            Inbox::default()
+        } else {
+            Inbox::default().without_modes()
+        };
         let mut failed = Vec::new();
         let t = Instant::now();
         self.reader.fill_buf()?;
@@ -477,18 +517,34 @@ fn recv(reader: &mut BufReader<ChildStdout>) -> Result<Resp> {
     }
 }
 
-/// Streams the output of the `Exec` queued earlier, remote paths rewritten to local ones.
-/// Returns the exit code and whether the command printed anything. Works on the reader alone:
-/// the writer is busy on the scan thread meanwhile (see `run`).
-fn exec_output(reader: &mut BufReader<ChildStdout>, remote_home: &str, remote_dir: &str, local_root: &Path) -> Result<(i32, bool)> {
-    // the remote project path (`~` expanded with the agent's home) for output rewriting
-    let remote_abs = match remote_dir.strip_prefix("~/") {
+/// The project copy as the host's build prints it: `~` expanded with the agent's home, and with
+/// `\` on a Windows host.
+fn remote_root(remote_home: &str, remote_dir: &str, windows: bool) -> String {
+    let abs = match remote_dir.strip_prefix("~/") {
         Some(r) => format!("{remote_home}/{r}"),
         None => remote_dir.to_string(),
     };
+    if windows {
+        abs.replace('/', "\\")
+    } else {
+        abs
+    }
+}
+
+/// Streams the output of the `Exec` queued earlier, remote paths rewritten to local ones.
+/// Returns the exit code and whether the command printed anything. Works on the reader alone:
+/// the writer is busy on the scan thread meanwhile (see `run`).
+fn exec_output(reader: &mut BufReader<ChildStdout>, remote_root: &str, windows_host: bool, local_root: &Path) -> Result<(i32, bool)> {
     let local = local_root.to_string_lossy().into_owned();
-    let mut out_rw = LineRewriter::new(&remote_abs, &local);
-    let mut err_rw = LineRewriter::new(&remote_abs, &local);
+    let rewriter = || {
+        if windows_host {
+            LineRewriter::windows_host(remote_root, &local)
+        } else {
+            LineRewriter::new(remote_root, &local)
+        }
+    };
+    let mut out_rw = rewriter();
+    let mut err_rw = rewriter();
     let stdout = io::stdout();
     let stderr = io::stderr();
     let mut printed = false;
@@ -771,12 +827,9 @@ pub fn run(root: &Path, cfg: &Config, cmd: &[String], opts: &RunOptions) -> Resu
     let mut code = 0;
     // when the command ended (or the pull scan began, without one): what the scan takes past it is the pull's
     let mut exec_end = Instant::now();
-    let Session {
-        reader,
-        writer,
-        remote_home,
-        ..
-    } = &mut session;
+    let windows_host = !session.host_modes();
+    let remote_abs = remote_root(&session.remote_home, &remote_dir, windows_host);
+    let Session { reader, writer, .. } = &mut session;
     thread::scope(|scope| -> Result<()> {
         let scan = scope.spawn(|| -> Result<()> {
             if !opts.pull {
@@ -794,7 +847,7 @@ pub fn run(root: &Path, cfg: &Config, cmd: &[String], opts: &RunOptions) -> Resu
             // an empty line on either side of the command's output sets it apart from these lines
             say(String::new());
             let printed;
-            (code, printed) = exec_output(reader, remote_home, &remote_dir, root)?;
+            (code, printed) = exec_output(reader, &remote_abs, windows_host, root)?;
             exec_end = Instant::now();
             if printed {
                 say(String::new());
@@ -883,20 +936,9 @@ pub fn gc(cfg: &Config, days: Option<u32>, dry_run: bool) -> Result<()> {
     Ok(())
 }
 
-/// The program of a command as this machine runs it. The command is spelled for the host, so on
-/// Windows a `./gradlew` is the `gradlew.bat` beside it.
-fn local_program(root: &Path, program: &str) -> OsString {
-    let bat: PathBuf = root.join(program).with_extension("bat").components().collect();
-    if cfg!(windows) && bat.is_file() {
-        bat.into()
-    } else {
-        program.into()
-    }
-}
-
 pub fn run_local(root: &Path, cmd: &[String]) -> Result<i32> {
     // tell the Gradle shim not to try the remote again
-    let status = Command::new(local_program(root, &cmd[0]))
+    let status = Command::new(program_in(root, &cmd[0]))
         .args(&cmd[1..])
         .env("MIRAKO_LOCAL", "1")
         .current_dir(root)
@@ -924,51 +966,69 @@ pub fn check(cfg: &Config) -> Result<()> {
     Ok(())
 }
 
-/// Put this version at `remote_bin` on the host: a copy of this binary when OS/arch match,
-/// otherwise a build there with the host's own cargo.
+/// Put this version at `remote_bin` on the host: a copy of this binary when the platforms match,
+/// else the release binary for the host's, else a build there with the host's own cargo.
 pub fn remote_install(cfg: &Config) -> Result<()> {
-    let uname = |host: bool| -> Result<String> {
-        let out = if host {
-            ssh(cfg).arg("uname -sm").stdin(Stdio::null()).output()?
-        } else {
-            Command::new("uname").arg("-sm").output()?
-        };
-        Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
-    };
-    // Windows has no `uname`, and no host answers like it would: the agent is built there
-    let local = if cfg!(windows) { String::new() } else { uname(false)? };
-    let remote = uname(true)?;
-    if remote.is_empty() {
-        bail!("cannot ssh to {}", cfg.host);
+    let host = host::probe(cfg)?;
+    host::remember(cfg, host.shell);
+    if host.platform == host::this_platform() {
+        return upload(cfg, host.shell);
     }
-    if local != remote {
-        return build_on_host(cfg, &remote);
+    if let Some(url) = host::release_url(&host.platform) {
+        eprintln!(
+            "mirako: {} is `{}`, this binary is not: downloading mirako {} there",
+            cfg.host,
+            host.platform,
+            proto::VERSION
+        );
+        match download(cfg, host.shell, &url) {
+            Ok(()) => return Ok(()),
+            Err(e) => eprintln!("mirako: {e:#}; building it there instead"),
+        }
     }
-    let me = std::env::current_exe()?;
-    let bytes = fs::read(&me)?;
-    let dest = cfg.remote_bin.clone();
-    let script =
-        format!("mkdir -p \"$(dirname {dest})\" && cat > {dest}.tmp && chmod +x {dest}.tmp && mv {dest}.tmp {dest} && {dest} --version");
-    let mut child = ssh(cfg).arg(script).stdin(Stdio::piped()).spawn()?;
+    build_on_host(cfg, host.shell, &host.platform)
+}
+
+/// This binary, through the stdin of the install script.
+fn upload(cfg: &Config, shell: Shell) -> Result<()> {
+    let bytes = fs::read(std::env::current_exe()?)?;
+    let mut child = ssh(cfg)
+        .arg(shell.install_script(&cfg.remote_bin, Source::Stdin))
+        .stdin(Stdio::piped())
+        .spawn()?;
     child.stdin.take().unwrap().write_all(&bytes)?;
-    let status = child.wait()?;
-    if !status.success() {
+    if !child.wait()?.success() {
         bail!("install on {} failed", cfg.host);
     }
-    println!("installed {} ({}) on {}", dest, human(bytes.len() as u64), cfg.host);
+    println!("installed {} ({}) on {}", cfg.remote_bin, human(bytes.len() as u64), cfg.host);
     Ok(())
 }
 
-/// The host runs another OS or architecture: `cargo install` the release tag of this version
-/// there (needs Rust on the host) and move the binary to `remote_bin`.
-fn build_on_host(cfg: &Config, remote_os: &str) -> Result<()> {
+fn download(cfg: &Config, shell: Shell, url: &str) -> Result<()> {
+    let status = ssh(cfg)
+        .arg(shell.install_script(&cfg.remote_bin, Source::Url(url)))
+        .stdin(Stdio::null())
+        .status()?;
+    match status.code() {
+        Some(0) => {
+            println!("installed {} on {} from {url}", cfg.remote_bin, cfg.host);
+            Ok(())
+        }
+        Some(4) => bail!("no curl on {} to download {url}", cfg.host),
+        _ => bail!("downloading {url} on {} failed", cfg.host),
+    }
+}
+
+/// No binary of this version for the host's platform: `cargo install` its release tag there
+/// (needs Rust on the host) and move the binary to `remote_bin`.
+fn build_on_host(cfg: &Config, shell: Shell, platform: &str) -> Result<()> {
     eprintln!(
-        "mirako: {} is `{remote_os}`, this binary is not: building mirako {} there with cargo (a few minutes)",
+        "mirako: {} is `{platform}`, no binary of mirako {} is: building it there with cargo (a few minutes)",
         cfg.host,
         proto::VERSION
     );
     let status = ssh(cfg)
-        .arg(build_script(proto::VERSION, &cfg.remote_bin))
+        .arg(shell.install_script(&cfg.remote_bin, Source::Cargo))
         .stdin(Stdio::null())
         .status()?;
     let manual = format!("`cargo install --git {REPO} --tag v{}`", proto::VERSION);
@@ -985,16 +1045,6 @@ fn build_on_host(cfg: &Config, remote_os: &str) -> Result<()> {
     }
 }
 
-/// Remote sh: cargo from PATH or `~/.cargo/bin` (exit 3 when neither) installs the tag into a
-/// scratch root, then the binary moves to `remote_bin`.
-fn build_script(version: &str, remote_bin: &str) -> String {
-    format!(
-        "C=$(command -v cargo || echo \"$HOME/.cargo/bin/cargo\"); [ -x \"$C\" ] || exit 3; \
-         \"$C\" install --git {REPO} --tag v{version} --force --root \"$HOME/.mirako-build\" && \
-         mkdir -p \"$(dirname {remote_bin})\" && mv \"$HOME/.mirako-build/bin/mirako\" {remote_bin} && {remote_bin} --version"
-    )
-}
-
 pub fn project_root_for(path: Option<&PathBuf>) -> Result<PathBuf> {
     let start = match path {
         Some(p) => p.clone(),
@@ -1008,28 +1058,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_build_script_installs_this_versions_tag_and_exits_3_without_cargo() {
-        let s = build_script("0.4.0", "~/.local/bin/mirako");
-        assert!(s.contains(&format!("install --git {REPO} --tag v0.4.0")), "{s}");
-        assert!(s.contains("|| exit 3;"), "{s}");
-        assert!(
-            s.ends_with("mv \"$HOME/.mirako-build/bin/mirako\" ~/.local/bin/mirako && ~/.local/bin/mirako --version"),
-            "{s}"
-        );
-    }
-
-    #[test]
-    fn the_local_fallback_runs_the_bat_beside_the_command_on_windows_only() {
-        let dir = tempfile::tempdir().unwrap();
-        fs::write(dir.path().join("gradlew"), "").unwrap();
-        fs::write(dir.path().join("gradlew.bat"), "").unwrap();
-        let wrapper = PathBuf::from(local_program(dir.path(), "./gradlew"));
-        if cfg!(windows) {
-            assert_eq!(wrapper, dir.path().join("gradlew.bat"));
-        } else {
-            assert_eq!(wrapper, Path::new("./gradlew"));
-        }
-        assert_eq!(local_program(dir.path(), "echo"), OsString::from("echo"));
+    fn the_remote_root_is_spelled_as_the_hosts_build_prints_it() {
+        assert_eq!(remote_root("/Users/b", "~/mirako/app", false), "/Users/b/mirako/app");
+        assert_eq!(remote_root("/Users/b", "/srv/m/app", false), "/srv/m/app");
+        assert_eq!(remote_root(r"C:\Users\b", "~/mirako/app", true), r"C:\Users\b\mirako\app");
+        assert_eq!(remote_root(r"C:\Users\b", "D:/m/app", true), r"D:\m\app");
     }
 
     #[test]

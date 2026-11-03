@@ -9,6 +9,7 @@ use crate::proto::{self, read_frame, write_frame, Chunk, DeltaChunk, Entry, Kind
 use crate::xfer::{canonical, safe_join, Inbox};
 use anyhow::{bail, Context, Result};
 use std::collections::HashMap;
+use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
@@ -34,6 +35,10 @@ const GRACE: Duration = Duration::from_secs(2);
 struct Hangup {
     gone: AtomicBool,
     group: AtomicI32,
+    /// Windows: the job object holding the running command and every process it started, which a
+    /// hang-up terminates. Behind a lock, so that it is never used and closed at once.
+    #[cfg(windows)]
+    job: Mutex<Option<job::Job>>,
 }
 
 impl Hangup {
@@ -44,26 +49,75 @@ impl Hangup {
         if group == 0 {
             return;
         }
-        signal_group(group, false);
+        self.signal(group, false);
         thread::sleep(GRACE);
         // unchanged: `exec` is still on it, so the command or something it started lives, and while
         // one of them does the id cannot have gone to another group
         if self.group.load(Ordering::SeqCst) == group {
-            signal_group(group, true);
+            self.signal(group, true);
+        }
+    }
+
+    /// SIGTERM, or with `force` SIGKILL, to every process of the group.
+    #[cfg(unix)]
+    fn signal(&self, group: i32, force: bool) {
+        // SAFETY: a plain syscall; a group that is gone already answers ESRCH
+        unsafe { libc::killpg(group, if force { libc::SIGKILL } else { libc::SIGTERM }) };
+    }
+
+    /// Windows has no SIGTERM to send a console program it shares no console with: the job of the
+    /// command is terminated at the first signal, every process in it.
+    #[cfg(windows)]
+    fn signal(&self, _: i32, _: bool) {
+        if let Some(job) = self.job.lock().unwrap().as_ref() {
+            job.terminate();
         }
     }
 }
 
-/// SIGTERM, or with `force` SIGKILL, to every process of the group.
-#[cfg(unix)]
-fn signal_group(group: i32, force: bool) {
-    // SAFETY: a plain syscall; a group that is gone already answers ESRCH
-    unsafe { libc::killpg(group, if force { libc::SIGKILL } else { libc::SIGTERM }) };
-}
+/// A job object: a command and the processes it starts from then on, all of which
+/// `TerminateJobObject` stops. Closing it leaves them running (no `KILL_ON_JOB_CLOSE`), so a build
+/// that ends leaves its Gradle daemon up for the next one.
+#[cfg(windows)]
+mod job {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows_sys::Win32::System::JobObjects::{AssignProcessToJobObject, CreateJobObjectW, TerminateJobObject};
 
-/// A Windows host is not supported: the command there runs on.
-#[cfg(not(unix))]
-fn signal_group(_: i32, _: bool) {}
+    pub struct Job(HANDLE);
+
+    // SAFETY: a job handle can be used, and closed, from any thread
+    unsafe impl Send for Job {}
+
+    impl Job {
+        /// A job holding `child`, `None` when Windows refuses one (the command then runs to its end
+        /// on a hang-up). What `child` starts in the moment before it joins stays outside: nothing,
+        /// for a `cmd.exe` that has a batch file to read first.
+        pub fn new(child: &std::process::Child) -> Option<Self> {
+            // SAFETY: plain calls; the handle belongs to the `Job` from its creation on
+            unsafe {
+                let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+                if job.is_null() {
+                    return None;
+                }
+                let job = Job(job);
+                (AssignProcessToJobObject(job.0, child.as_raw_handle() as HANDLE) != 0).then_some(job)
+            }
+        }
+
+        pub fn terminate(&self) {
+            // SAFETY: `self.0` is open until `drop`
+            unsafe { TerminateJobObject(self.0, 1) };
+        }
+    }
+
+    impl Drop for Job {
+        fn drop(&mut self) {
+            // SAFETY: closed once, here
+            unsafe { CloseHandle(self.0) };
+        }
+    }
+}
 
 fn send(out: &Out, resp: &Resp) -> Result<()> {
     let mut w = out.lock().unwrap();
@@ -79,12 +133,59 @@ fn stream(out: &Out, resp: &Resp) -> Result<()> {
 }
 
 pub fn expand_home(p: &str) -> PathBuf {
-    if let Some(rest) = p.strip_prefix("~/") {
-        if let Some(home) = dirs::home_dir() {
-            return home.join(rest);
+    let path = match (p.strip_prefix("~/"), dirs::home_dir()) {
+        (Some(rest), Some(home)) => home.join(rest),
+        _ => PathBuf::from(p),
+    };
+    // the wire's `/` as Windows writes it: the root goes into the build's output that way
+    if cfg!(windows) {
+        path.components().collect()
+    } else {
+        path
+    }
+}
+
+/// The program of a command as this machine starts it in `dir`. Commands are spelled for a Unix
+/// host (`./gradlew`), and Windows looks a relative path up from the directory of the process
+/// that starts it, not the command's: there such a path is made absolute under `dir`, and without
+/// an extension it is the `.exe`, `.bat` or `.cmd` of that name (the `gradlew.bat` beside
+/// `gradlew`). A bare name that `PATH` has only as a `.bat` or `.cmd` (`gradle`) is that file:
+/// Windows itself looks for an `.exe` alone.
+pub fn program_in(dir: &Path, prog: &str) -> OsString {
+    if cfg!(windows) {
+        windows_program(dir, prog, std::env::var_os("PATH").as_deref())
+    } else {
+        prog.into()
+    }
+}
+
+fn windows_program(dir: &Path, prog: &str, path_var: Option<&OsStr>) -> OsString {
+    if prog.contains(['/', '\\']) {
+        let full: PathBuf = dir.join(prog).components().collect();
+        if full.extension().is_none() {
+            for ext in ["exe", "bat", "cmd"] {
+                let it = full.with_extension(ext);
+                if it.is_file() {
+                    return it.into();
+                }
+            }
+        }
+        return full.into();
+    }
+    if Path::new(prog).extension().is_none() {
+        for d in path_var.map(std::env::split_paths).into_iter().flatten() {
+            if d.join(format!("{prog}.exe")).is_file() {
+                break; // the one Windows finds
+            }
+            for ext in ["bat", "cmd"] {
+                let it = d.join(format!("{prog}.{ext}"));
+                if it.is_file() {
+                    return it.into();
+                }
+            }
         }
     }
-    PathBuf::from(p)
+    prog.into()
 }
 
 pub fn serve() -> Result<()> {
@@ -190,7 +291,14 @@ pub fn serve() -> Result<()> {
             }
             Req::Symlink { path, target } => {
                 let (root, _) = index.as_ref().context("Symlink before Manifest")?;
-                inbox.symlink(root, &path, &target)
+                match inbox.symlink(root, &path, &target) {
+                    // Windows makes no links (see `xfer::make_symlink`): said, and the build runs without it
+                    Err(e) if cfg!(windows) => {
+                        eprintln!("mirako serve: {e:#}");
+                        Ok(())
+                    }
+                    r => r,
+                }
             }
             Req::Delete { paths } => {
                 let (root, _) = index.as_ref().context("Delete before Manifest")?;
@@ -370,7 +478,7 @@ fn exec(out: &Out, hangup: &Arc<Hangup>, dir: &Path, cmd: &[String], env: Vec<(S
     let Some((prog, args)) = cmd.split_first() else {
         bail!("empty command")
     };
-    let mut command = Command::new(prog);
+    let mut command = Command::new(program_in(dir, prog));
     command
         .args(args)
         .current_dir(dir)
@@ -384,7 +492,15 @@ fn exec(out: &Out, hangup: &Arc<Hangup>, dir: &Path, cmd: &[String], env: Vec<(S
     // a process group of its own, so that a hang-up stops what the command started as well
     #[cfg(unix)]
     std::os::unix::process::CommandExt::process_group(&mut command, 0);
+    // a console of its own that shows no window, whatever the agent has
+    #[cfg(windows)]
+    std::os::windows::process::CommandExt::creation_flags(&mut command, windows_sys::Win32::System::Threading::CREATE_NO_WINDOW);
     let mut child = command.spawn().with_context(|| format!("starting `{prog}` in {}", dir.display()))?;
+    // and on Windows a job, before the group: a hang-up seeing the one finds the other
+    #[cfg(windows)]
+    {
+        *hangup.job.lock().unwrap() = job::Job::new(&child);
+    }
     let group = child.id() as i32;
     hangup.group.store(group, Ordering::SeqCst);
     if hangup.gone.load(Ordering::SeqCst) {
@@ -422,13 +538,17 @@ fn exec(out: &Out, hangup: &Arc<Hangup>, dir: &Path, cmd: &[String], env: Vec<(S
     let status = child.wait()?;
     if hangup.gone.load(Ordering::SeqCst) {
         // whatever of its group outlived the command
-        signal_group(group, true);
+        hangup.signal(group, true);
     }
     // the group stays registered while the pumps run: what the command left behind holds their
     // pipes open, and a hang-up from here on has that to stop
     let _ = t1.join();
     let _ = t2.join();
     hangup.group.store(0, Ordering::SeqCst);
+    #[cfg(windows)]
+    {
+        *hangup.job.lock().unwrap() = None;
+    }
     send(
         out,
         &Resp::Exit {
@@ -457,6 +577,43 @@ mod tests {
             self.pos += n;
             Ok(n)
         }
+    }
+
+    #[test]
+    fn a_relative_program_is_found_under_the_dir_with_the_extension_windows_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        fs::write(d.join("gradlew"), "").unwrap();
+        fs::write(d.join("gradlew.bat"), "").unwrap();
+        fs::create_dir_all(d.join("tools")).unwrap();
+        fs::write(d.join("tools/x.cmd"), "").unwrap();
+        assert_eq!(PathBuf::from(windows_program(d, "./gradlew", None)), d.join("gradlew.bat"));
+        assert_eq!(PathBuf::from(windows_program(d, "tools/x", None)), d.join("tools/x.cmd"));
+        // an extension is kept, a file that is not there named as it is
+        assert_eq!(PathBuf::from(windows_program(d, "./gradlew.bat", None)), d.join("gradlew.bat"));
+        assert_eq!(PathBuf::from(windows_program(d, "./missing", None)), d.join("missing"));
+        // on this side of Windows a relative program is left to the command's own directory
+        if !cfg!(windows) {
+            assert_eq!(program_in(d, "./gradlew"), OsString::from("./gradlew"));
+        }
+    }
+
+    #[test]
+    fn a_bare_program_is_the_bat_or_cmd_of_path_unless_an_exe_comes_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b) = (dir.path().join("a"), dir.path().join("b"));
+        fs::create_dir_all(&a).unwrap();
+        fs::create_dir_all(&b).unwrap();
+        fs::write(b.join("gradle.bat"), "").unwrap();
+        fs::write(a.join("java.exe"), "").unwrap();
+        fs::write(b.join("java.cmd"), "").unwrap();
+        let path = std::env::join_paths([&a, &b]).unwrap();
+        let find = |p: &str| windows_program(dir.path(), p, Some(&path));
+        assert_eq!(PathBuf::from(find("gradle")), b.join("gradle.bat"));
+        assert_eq!(find("java"), OsString::from("java"));
+        assert_eq!(find("echo"), OsString::from("echo"));
+        assert_eq!(find("gradle.bat"), OsString::from("gradle.bat"));
+        assert_eq!(windows_program(dir.path(), "gradle", None), OsString::from("gradle"));
     }
 
     #[test]

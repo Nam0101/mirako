@@ -50,31 +50,69 @@ there is none and runs `ssh-copy-id`, which asks for the host's password once), 
 the agent's non-interactive shell on the host sees (java, `ANDROID_HOME`, free disk) with a
 warning for each missing piece, writes the Gradle init script, and handshakes, which puts this
 binary on the host as `~/.local/bin/mirako` (`remote_bin`). A host with another OS or
-architecture gets the agent built there instead, by its own cargo from this version's release
-tag (`cargo install --git … --tag v<version>`, a few minutes), so it needs Rust 1.99 or later.
+architecture gets the release binary of this version for it instead, downloaded there (with
+`curl`, or PowerShell on Windows); for one that has none (an Intel Mac, Windows on ARM) the agent
+is built there by its own cargo from this version's release tag (`cargo install --git … --tag
+v<version>`, a few minutes), which needs Rust 1.99 or later on the host.
 From then on the client keeps both in step: a handshake that finds no agent, or one of another
 version, installs it the same way and retries, and `mirako run` rewrites the Gradle init script
 when it is out of date, so after a `cargo install` nothing else is needed. The pieces on their
 own: `mirako init --global`, `mirako gradle-shim install`, `mirako remote-install --host m4`.
 
 The remote needs whatever the command needs (JDK, Android SDK, …) reachable from a
-non-interactive ssh shell. On macOS put `JAVA_HOME`/`ANDROID_HOME`/`PATH` in `~/.zshenv`.
+non-interactive ssh shell. On macOS put `JAVA_HOME`/`ANDROID_HOME`/`PATH` in `~/.zshenv`; on a
+Windows host make them environment variables of your user there.
 
 ### Windows
 
-Windows is a client only: the builds run on a macOS or Linux host, reached with the `ssh` that
-ships with Windows. What differs from a Unix client:
+Windows runs natively at either end, with the OpenSSH that ships with it: no WSL, no Cygwin.
 
-- `mirako setup` cannot set up key authentication there (no `ssh-copy-id`): make `ssh <host>`
-  work without a password first.
-- The agent is always built on the host by its cargo, as for any host of another OS, so Rust
-  must be installed on the host.
+**As the client**, the machine you work on, with a macOS, Linux or Windows host:
+
+- Windows has no `ssh-copy-id`: `mirako setup` adds your key to `~/.ssh/authorized_keys` of a
+  Unix host itself (ssh asks for the host's password once). For a Windows host, put it in place
+  yourself (below).
 - Windows has no permission bits: every file is uploaded as 0755, which lets `./gradlew` run on
-  the host. It also needs LF line endings there (`gradlew text eol=lf` in `.gitattributes`).
+  a Unix host. It also needs LF line endings there (`gradlew text eol=lf` in `.gitattributes`).
 - Symlinks among the downloaded files are not created; one line on stderr counts them
   (`exclude_remote_extra` leaves them out).
 - With `fallback = true`, a `./gradlew …` that cannot reach the host runs the `gradlew.bat`
   next to it.
+
+**As the host**, the build machine, for a client of any OS:
+
+1. Turn on its OpenSSH server: Settings → System → Optional features → OpenSSH Server, then
+   `Start-Service sshd; Set-Service sshd -StartupType Automatic` in an administrator PowerShell.
+2. Key authentication: the key of a user in the Administrators group goes into
+   `C:\ProgramData\ssh\administrators_authorized_keys` (which only Administrators and SYSTEM
+   may read: `icacls administrators_authorized_keys /inheritance:r /grant Administrators:F /grant SYSTEM:F`),
+   anyone else's into `%USERPROFILE%\.ssh\authorized_keys`.
+3. `JAVA_HOME`, `ANDROID_HOME` and `PATH` as environment variables of your user (System
+   Properties → Environment Variables, or `setx`): that is the environment of the builds.
+4. `mirako setup --host <it>` on the client, which reports what the host has and installs the
+   agent there: a copy of the client's binary from a Windows client, the `windows-x86_64`
+   release binary otherwise (or, without one, `cargo install`, which needs Rust and the MSVC
+   build tools on the host).
+
+What differs from a Unix host:
+
+- Every command mirako sends goes through the host's shell, `cmd.exe`, or PowerShell when
+  OpenSSH's `DefaultShell` is set to it. The client finds out which on its first contact (cmd
+  then says once on stderr that it does not know `~/.local/bin/mirako`) and remembers it, next
+  to its index caches.
+- `~` in `remote_bin` and `remote_folder` is your profile (`%USERPROFILE%`), and a `remote_bin`
+  without an extension gets `.exe`: the defaults are `%USERPROFILE%\.local\bin\mirako.exe` and
+  `%USERPROFILE%\mirako`.
+- `./gradlew` runs the project's `gradlew.bat`: a command with a relative path runs the `.exe`,
+  `.bat` or `.cmd` of that name in the project copy. Keep `gradlew.bat` with CRLF line endings
+  (`*.bat text eol=crlf`, as Gradle's own `.gitattributes` has it).
+- The build prints the project copy as `C:\Users\you\mirako\app\…`: those paths are
+  rewritten to the client's, `/` for `\` on a macOS or Linux client.
+- Stopping a run stops the command at once, with all it started (a job object holds them):
+  Windows has no SIGTERM to give it first.
+- There are no permission bits: modes are not compared, and a file pulled from the host gets
+  the mode of a new file on the client. Symlinks are not made on the host: each one is reported
+  on stderr and the build runs without it.
 
 ## Configure
 
@@ -144,8 +182,8 @@ mirako --help
 
 Stopping a run (Ctrl-C, the stop button of Android Studio) stops the command on the host as
 well: when the connection closes the agent sends SIGTERM to the command and everything it
-started, and SIGKILL to what is left two seconds later at most. Two runs of one project never
-overlap: the second waits for the first.
+started, and SIGKILL to what is left two seconds later at most (a Windows host ends them all at
+once). Two runs of one project never overlap: the second waits for the first.
 
 A transfer that takes more than a second reports on stderr how far it is
 (`push   42.0 MB of 95.4 MB, 12.1 MB/s`; a pull counts the bytes received): one line redrawn in
