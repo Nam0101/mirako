@@ -109,7 +109,11 @@ What differs from a Unix host:
 - The build prints the project copy as `C:\Users\you\mirako\app\…`: those paths are
   rewritten to the client's, `/` for `\` on a macOS or Linux client.
 - Stopping a run stops the command at once, with all it started (a job object holds them):
-  Windows has no SIGTERM to give it first.
+  Windows has no SIGTERM to give it first. A Gradle daemon an earlier run started is not part of
+  it and stops the build as Gradle does when its client goes away.
+- The Gradle daemon outlives the run, as on a Unix host. OpenSSH ends a session by killing
+  every process in it, so the agent starts the command outside that job, and none of the
+  session's pipes reach it (a daemon holding one would keep the client waiting).
 - There are no permission bits: modes are not compared, and a file pulled from the host gets
   the mode of a new file on the client. Symlinks are not made on the host: each one is reported
   on stderr and the build runs without it.
