@@ -757,6 +757,100 @@ fn an_agent_that_leaves_without_answering_is_replaced() {
     assert_eq!(fs::read(&agent).unwrap(), fs::read(BIN).unwrap());
 }
 
+/// A stand-in for `ssh` to a Windows host whose `DefaultShell` is cmd, at `<scratch>/winssh.sh`:
+/// it answers the probe as cmd does, runs `agent` for a `serve` spelled for cmd (exit 127 while
+/// `agent` is missing), fails as cmd does on one spelled for sh, and exits 3 on the PowerShell
+/// scripts that install an agent (no cargo there either). Each command is a line of `<scratch>/ssh.log`.
+fn fake_windows_ssh(s: &Scratch, agent: &Path) -> PathBuf {
+    let path = s.path.join("winssh.sh");
+    let script = format!(
+        "#!/bin/sh\nfor last; do :; done\nprintf '%s\\n' \"$last\" >> {log:?}\ncase \"$last\" in\n  \"echo %OS%\"*) echo 'Windows_NT AMD64 $env:OS $env:PROCESSOR_ARCHITECTURE; uname -sm' ;;\n  \"if exist \"*) [ -x {agent:?} ] || exit 127; exec {agent:?} serve ;;\n  powershell\\ *) exit 3 ;;\n  *) echo \"'~' is not recognized as an internal or external command\" >&2; exit 1 ;;\nesac\n",
+        log = s.path.join("ssh.log"),
+    );
+    fs::write(&path, script).unwrap();
+    path
+}
+
+/// What the stand-ins of `ssh` were asked since the last call: `sh serve`, `cmd serve`, `probe`,
+/// `powershell`, or the command itself.
+fn ssh_log(s: &Scratch) -> Vec<String> {
+    let log = s.path.join("ssh.log");
+    let text = fs::read_to_string(&log).unwrap_or_default();
+    let _ = fs::remove_file(&log);
+    text.lines()
+        .map(|l| match l {
+            _ if l.starts_with("if exist ") => "cmd serve".to_string(),
+            _ if l.starts_with("echo %OS%") => "probe".to_string(),
+            _ if l.starts_with("powershell ") => "powershell".to_string(),
+            _ if l.ends_with(" serve") => "sh serve".to_string(),
+            _ => l.to_string(),
+        })
+        .collect()
+}
+
+#[test]
+fn a_host_whose_shell_is_cmd_is_probed_once_and_remembered() {
+    let s = Scratch::new();
+    let fake = fake_windows_ssh(&s, Path::new(BIN));
+    let p = s.project("app", &format!("ssh = [\"sh\", {:?}]", fake.to_str().unwrap()));
+    let o = p.sub("check", &[]);
+    assert_eq!(o.status.code(), Some(0), "{}", show(&o));
+    assert_eq!(ssh_log(&s), ["sh serve", "probe", "cmd serve"]);
+    // known from now on
+    let o = p.sub("check", &[]);
+    assert_eq!(o.status.code(), Some(0), "{}", show(&o));
+    assert_eq!(ssh_log(&s), ["cmd serve"]);
+    p.write("src/a.txt", b"a");
+    p.run_ok(&[], &["true"]);
+    assert_eq!(ssh_log(&s), ["cmd serve"]);
+    assert_eq!(read(&p.remote.join("src/a.txt")), b"a");
+
+    // the same host turns out to run sh after all (the alias names another machine now): found again
+    fs::write(
+        &fake,
+        format!(
+            "#!/bin/sh\nfor last; do :; done\nprintf '%s\\n' \"$last\" >> {:?}\ncase \"$last\" in\n  \"if exist \"*) exit 2 ;;\n  *\" serve\") exec $last ;;\n  *) exec sh -c \"$last\" ;;\nesac\n",
+            s.path.join("ssh.log")
+        ),
+    )
+    .unwrap();
+    let o = p.sub("check", &[]);
+    assert_eq!(o.status.code(), Some(0), "{}", show(&o));
+    assert_eq!(ssh_log(&s), ["cmd serve", "probe", "sh serve"]);
+    let o = p.sub("check", &[]);
+    assert_eq!(o.status.code(), Some(0), "{}", show(&o));
+    assert_eq!(ssh_log(&s), ["sh serve"]);
+}
+
+#[test]
+fn a_windows_host_without_an_agent_is_sent_powershell_to_download_or_build_one() {
+    let s = Scratch::new();
+    let agent = s.path.join("agent/mirako");
+    let fake = fake_windows_ssh(&s, &agent);
+    let p = s.project(
+        "app",
+        &format!(
+            "ssh = [\"sh\", {:?}]\nremote_bin = {:?}",
+            fake.to_str().unwrap(),
+            agent.to_str().unwrap()
+        ),
+    );
+    let o = p.sub("check", &[]);
+    assert_eq!(o.status.code(), Some(2), "{}", show(&o));
+    // the release binary for Windows first, then cargo, which the host does not have
+    assert_eq!(ssh_log(&s), ["sh serve", "probe", "cmd serve", "probe", "powershell", "powershell"]);
+    let err = stderr(&o);
+    for want in [
+        "installing mirako",
+        "is `Windows AMD64`",
+        "downloading mirako",
+        "building it there",
+        "no cargo on loop",
+    ] {
+        assert!(err.contains(want), "missing {want:?} in {}", show(&o));
+    }
+}
+
 #[test]
 fn the_installed_init_script_follows_this_binary_and_shim_check() {
     let s = Scratch::new();

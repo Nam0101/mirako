@@ -5,6 +5,7 @@ pub mod client;
 pub mod config;
 pub mod delta;
 pub mod gc;
+pub mod host;
 pub mod index;
 pub mod patterns;
 pub mod progress;

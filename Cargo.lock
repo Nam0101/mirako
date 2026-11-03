@@ -531,7 +531,7 @@ dependencies = [
 
 [[package]]
 name = "mirako"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "blake3",
@@ -549,6 +549,7 @@ dependencies = [
  "tempfile",
  "toml",
  "walkdir",
+ "windows-sys",
  "zstd",
 ]
 

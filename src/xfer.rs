@@ -127,6 +127,8 @@ pub struct Inbox {
     open: HashMap<String, Inbound>,
     /// the agent's: see `mirror`
     replace_dirs: bool,
+    /// whether the modes on the wire are the sender's own: see `without_modes`
+    modes: bool,
     tx: mpsc::Sender<Written>,
     rx: mpsc::Receiver<Written>,
     in_flight: usize,
@@ -140,6 +142,7 @@ impl Default for Inbox {
         Inbox {
             open: HashMap::new(),
             replace_dirs: false,
+            modes: true,
             tx,
             rx,
             in_flight: 0,
@@ -153,10 +156,12 @@ fn tmp_path(dest: &Path) -> PathBuf {
     dest.with_file_name(format!(".mirako.{}.tmp", dest.file_name().unwrap_or_default().to_string_lossy()))
 }
 
-/// Moves a complete `tmp` over `dest` with its mode and mtime; returns the mtime a later scan
-/// reads back.
-fn install(tmp: &Path, dest: &Path, mode: u32, mtime_ns: i64, replace_dir: bool) -> Result<i64> {
-    set_mode(tmp, mode)?;
+/// Moves a complete `tmp` over `dest` with its mode (`None`: the one a new file gets) and mtime;
+/// returns the mtime a later scan reads back.
+fn install(tmp: &Path, dest: &Path, mode: Option<u32>, mtime_ns: i64, replace_dir: bool) -> Result<i64> {
+    if let Some(mode) = mode {
+        set_mode(tmp, mode)?;
+    }
     let _ = fs::remove_file(dest);
     over_dir(dest, replace_dir, || fs::rename(tmp, dest))?;
     // NTFS keeps 100 ns: report the mtime a later scan reads back, or its cache entry never hits
@@ -171,7 +176,7 @@ fn install(tmp: &Path, dest: &Path, mode: u32, mtime_ns: i64, replace_dir: bool)
 }
 
 /// A file that came in one chunk, on a thread of the pool.
-fn write_whole(dest: &Path, c: Chunk, replace_dir: bool) -> Result<Finished> {
+fn write_whole(dest: &Path, c: Chunk, modes: bool, replace_dir: bool) -> Result<Finished> {
     let written = (|| -> Result<(u64, [u8; 32], i64)> {
         if let Some(parent) = dest.parent() {
             fs::create_dir_all(parent)?;
@@ -179,7 +184,7 @@ fn write_whole(dest: &Path, c: Chunk, replace_dir: bool) -> Result<Finished> {
         let data = proto::decompress(&c.data)?;
         let tmp = tmp_path(dest);
         fs::write(&tmp, &data)?;
-        let mtime_ns = install(&tmp, dest, c.mode, c.mtime_ns, replace_dir)?;
+        let mtime_ns = install(&tmp, dest, modes.then_some(c.mode), c.mtime_ns, replace_dir)?;
         Ok((data.len() as u64, *blake3::hash(&data).as_bytes(), mtime_ns))
     })();
     match written {
@@ -202,6 +207,12 @@ impl Inbox {
             replace_dirs: true,
             ..Self::default()
         }
+    }
+
+    /// For a sender whose modes mean nothing (a Windows host says 0755 for every file): a file
+    /// gets the mode of a new file here instead.
+    pub fn without_modes(self) -> Self {
+        Inbox { modes: false, ..self }
     }
 
     fn start(&mut self, root: &Path, rel: &str, with_old: bool) -> Result<()> {
@@ -250,7 +261,7 @@ impl Inbox {
                 });
             }
         }
-        let mtime_ns = install(&tmp, &dest, mode, mtime_ns, self.replace_dirs)?;
+        let mtime_ns = install(&tmp, &dest, self.modes.then_some(mode), mtime_ns, self.replace_dirs)?;
         Ok(Finished {
             path: rel.into(),
             size,
@@ -320,11 +331,11 @@ impl Inbox {
             self.take_one();
         }
         let tx = self.tx.clone();
-        let replace_dir = self.replace_dirs;
+        let (modes, replace_dir) = (self.modes, self.replace_dirs);
         self.in_flight += cost;
         WRITER_POOL.spawn(move || {
             // the receiver is gone only when the transfer was abandoned
-            let _ = tx.send((cost, write_whole(&dest, c, replace_dir)));
+            let _ = tx.send((cost, write_whole(&dest, c, modes, replace_dir)));
         });
     }
 
@@ -485,6 +496,27 @@ mod tests {
         assert_eq!(index::mode(&md), if cfg!(unix) { 0o640 } else { 0o755 });
         assert_eq!(index::mtime_ns(&md), MTIME);
         assert!(tmp_files(&root.join("x/y")).is_empty());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn without_modes_a_file_gets_the_mode_of_a_new_file_here() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("probe"), b"").unwrap();
+        let new_file = index::mode(&fs::metadata(root.join("probe")).unwrap());
+        let mut c = chunk("whole", 0, true, b"w", 1);
+        c.mode = 0o755;
+        let mut inbox = Inbox::default().without_modes();
+        assert!(inbox.put(root, c).unwrap().is_none());
+        assert_eq!(inbox.settle().unwrap().len(), 1);
+        let (a, b) = (chunk("split", 0, false, b"ab", 4), chunk("split", 2, true, b"cd", 4));
+        assert!(inbox.put(root, Chunk { mode: 0o755, ..a }).unwrap().is_none());
+        assert!(inbox.put(root, Chunk { mode: 0o755, ..b }).unwrap().unwrap().ok);
+        for f in ["whole", "split"] {
+            assert_eq!(index::mode(&fs::metadata(root.join(f)).unwrap()), new_file, "{f}");
+        }
+        assert_eq!(fs::read(root.join("split")).unwrap(), b"abcd");
     }
 
     #[test]
